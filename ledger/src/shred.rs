@@ -612,6 +612,31 @@ impl TryFrom<Shred> for merkle::Shred {
     }
 }
 
+// bm: re-exposes the public free `recover` agave shipped through 4.0. 4.1 moved
+// the public FEC-recovery entrypoint into the `Bank`-coupled
+// `ShredRecoveryContext::recover` (filter.rs) and left only the internal
+// `merkle::recover` (which operates on `merkle::Shred`). This wrapper is a
+// verbatim copy of the 4.0 `shred::recover`: it converts public `Shred`s into
+// `merkle::Shred`, runs the (unchanged) `merkle::recover`, and converts back —
+// so a no-`Bank` consumer can drive recovery directly.
+pub fn recover<T: IntoIterator<Item = Shred>>(
+    shreds: T,
+    reed_solomon_cache: &ReedSolomonCache,
+) -> Result<impl Iterator<Item = Result<Shred, Error>> + use<T>, Error> {
+    let shreds = shreds
+        .into_iter()
+        .map(|shred| {
+            debug_assert!(matches!(
+                shred.common_header().shred_variant,
+                ShredVariant::MerkleCode { .. } | ShredVariant::MerkleData { .. }
+            ));
+            merkle::Shred::try_from(shred)
+        })
+        .collect::<Result<_, _>>()?;
+    let shreds = merkle::recover(shreds, reed_solomon_cache)?;
+    Ok(shreds.map(|shred| shred.map(Shred::from)))
+}
+
 impl From<ShredVariant> for ShredType {
     #[inline]
     fn from(shred_variant: ShredVariant) -> Self {
