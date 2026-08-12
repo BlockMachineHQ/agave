@@ -332,6 +332,238 @@ impl ShredId {
     }
 }
 
+/// Result of comparing two normalized shred payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShredComparison {
+    DifferentId,
+    SamePayload,
+    ConflictingPayload,
+}
+
+/// Leader-authenticated identity of one FEC set.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FecSetId {
+    slot: Slot,
+    fec_set_index: u32,
+    merkle_root: Hash,
+}
+
+impl FecSetId {
+    pub fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    pub fn fec_set_index(&self) -> u32 {
+        self.fec_set_index
+    }
+
+    pub fn merkle_root(&self) -> Hash {
+        self.merkle_root
+    }
+}
+
+/// Public coding geometry without exposing the wire header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodingGeometry {
+    num_data: u16,
+    num_coding: u16,
+    position: u16,
+    first_coding_index: u32,
+}
+
+impl CodingGeometry {
+    pub fn num_data(&self) -> u16 {
+        self.num_data
+    }
+
+    pub fn num_coding(&self) -> u16 {
+        self.num_coding
+    }
+
+    pub fn position(&self) -> u16 {
+        self.position
+    }
+
+    pub fn first_coding_index(&self) -> u32 {
+        self.first_coding_index
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FecVariantShape {
+    proof_size: u8,
+    resigned: bool,
+}
+
+/// Normalized protocol metadata shared by all shreds in one FEC set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FecSetMeta {
+    id: FecSetId,
+    chained_merkle_root: Hash,
+    version: u16,
+    signature: Signature,
+    num_data: Option<u16>,
+    num_coding: Option<u16>,
+    first_coding_index: Option<u32>,
+    variant_shape: FecVariantShape,
+}
+
+impl FecSetMeta {
+    pub fn new(shred: &Shred) -> Result<Self, ShredValidationError> {
+        shred.sanitize()?;
+        let meta = Self {
+            id: FecSetId {
+                slot: shred.slot(),
+                fec_set_index: shred.fec_set_index(),
+                merkle_root: shred.merkle_root()?,
+            },
+            chained_merkle_root: shred.chained_merkle_root()?,
+            version: shred.version(),
+            signature: *shred.signature(),
+            num_data: None,
+            num_coding: None,
+            first_coding_index: None,
+            variant_shape: shred.variant_shape(),
+        };
+        let mut meta = meta;
+        meta.check_shred(shred)?;
+        Ok(meta)
+    }
+
+    pub fn id(&self) -> FecSetId {
+        self.id
+    }
+
+    pub fn chained_merkle_root(&self) -> Hash {
+        self.chained_merkle_root
+    }
+
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    pub fn signature(&self) -> Signature {
+        self.signature
+    }
+
+    pub fn num_data(&self) -> Option<u16> {
+        self.num_data
+    }
+
+    pub fn num_coding(&self) -> Option<u16> {
+        self.num_coding
+    }
+
+    pub fn first_coding_index(&self) -> Option<u32> {
+        self.first_coding_index
+    }
+
+    pub fn proof_size(&self) -> u8 {
+        self.variant_shape.proof_size
+    }
+
+    pub fn is_resigned(&self) -> bool {
+        self.variant_shape.resigned
+    }
+
+    /// Checks a shred against this FEC identity and learns coding geometry.
+    pub fn check_shred(&mut self, shred: &Shred) -> Result<(), ShredValidationError> {
+        shred.sanitize()?;
+        if shred.slot() != self.id.slot || shred.fec_set_index() != self.id.fec_set_index {
+            return Err(ShredValidationError::DifferentFecSet);
+        }
+        if shred.variant_shape() != self.variant_shape {
+            return Err(ShredValidationError::InconsistentVariantShape);
+        }
+        if shred.merkle_root()? != self.id.merkle_root
+            || shred.chained_merkle_root()? != self.chained_merkle_root
+            || shred.version() != self.version
+            || shred.signature() != &self.signature
+        {
+            return Err(ShredValidationError::InconsistentIdentity);
+        }
+        if let Some(geometry) = shred.coding_geometry()? {
+            if geometry.num_data == 0
+                || geometry.num_coding == 0
+                || geometry.position >= geometry.num_coding
+                || geometry
+                    .first_coding_index
+                    .checked_add(u32::from(geometry.position))
+                    != Some(shred.index())
+            {
+                return Err(ShredValidationError::InconsistentCodingGeometry);
+            }
+            let config = (
+                geometry.num_data,
+                geometry.num_coding,
+                geometry.first_coding_index,
+            );
+            match (self.num_data, self.num_coding, self.first_coding_index) {
+                (None, None, None) => {
+                    self.num_data = Some(config.0);
+                    self.num_coding = Some(config.1);
+                    self.first_coding_index = Some(config.2);
+                }
+                (Some(num_data), Some(num_coding), Some(first_coding_index))
+                    if (num_data, num_coding, first_coding_index) == config => {}
+                _ => return Err(ShredValidationError::InconsistentCodingGeometry),
+            }
+        }
+        self.check_index(shred)
+    }
+
+    fn check_index(&self, shred: &Shred) -> Result<(), ShredValidationError> {
+        let valid = match shred.shred_type() {
+            ShredType::Data => {
+                // Coding headers carry the exact geometry. Until one arrives,
+                // enforce Agave's fixed-FEC generation envelope.
+                let num_data = u32::from(
+                    self.num_data
+                        .unwrap_or((2 * DATA_SHREDS_PER_FEC_BLOCK - 1) as u16),
+                );
+                self.id
+                    .fec_set_index
+                    .checked_add(num_data)
+                    .is_some_and(|end| (self.id.fec_set_index..end).contains(&shred.index()))
+            }
+            ShredType::Code => self
+                .first_coding_index
+                .zip(self.num_coding)
+                .and_then(|(first, count)| {
+                    first.checked_add(u32::from(count)).map(|end| first..end)
+                })
+                .is_some_and(|range| range.contains(&shred.index())),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ShredValidationError::IndexOutOfRange)
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ShredValidationError {
+    #[error(transparent)]
+    Shred(#[from] Error),
+    #[error("empty FEC set")]
+    EmptyFecSet,
+    #[error("shred belongs to a different FEC set")]
+    DifferentFecSet,
+    #[error("inconsistent FEC identity")]
+    InconsistentIdentity,
+    #[error("inconsistent shred variant shape")]
+    InconsistentVariantShape,
+    #[error("inconsistent coding geometry")]
+    InconsistentCodingGeometry,
+    #[error("shred index is outside FEC geometry")]
+    IndexOutOfRange,
+    #[error("duplicate erasure shard")]
+    DuplicateErasureShard,
+    #[error("FEC sets are not adjacent in one slot")]
+    NotAdjacent,
+}
+
 /// Tuple which identifies erasure coding set that the shred belongs to.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct ErasureSetId(Slot, /*fec_set_index:*/ u32);
@@ -446,6 +678,69 @@ impl Shred {
                 Self::ShredData(shred)
             }
         })
+    }
+
+    /// Parses and sanitizes an owned serialized shred.
+    pub fn new_from_serialized_shred_sanitized<T>(shred: T) -> Result<Self, Error>
+    where
+        T: AsRef<[u8]> + Into<Payload>,
+        Payload: From<T>,
+    {
+        let shred = Self::new_from_serialized_shred(shred)?;
+        shred.sanitize()?;
+        Ok(shred)
+    }
+
+    /// Compares payloads while ignoring an optional retransmitter signature.
+    pub fn compare(&self, other: &Self) -> ShredComparison {
+        if self.id() != other.id() {
+            return ShredComparison::DifferentId;
+        }
+        if self.normalized_payload() == other.normalized_payload() {
+            ShredComparison::SamePayload
+        } else {
+            ShredComparison::ConflictingPayload
+        }
+    }
+
+    fn normalized_payload(&self) -> &[u8] {
+        let Ok(offset) = self.retransmitter_signature_offset() else {
+            return self.payload();
+        };
+        self.payload()
+            .get(..offset)
+            .unwrap_or_else(|| self.payload())
+    }
+
+    fn variant_shape(&self) -> FecVariantShape {
+        match self.common_header().shred_variant {
+            ShredVariant::MerkleCode {
+                proof_size,
+                resigned,
+            }
+            | ShredVariant::MerkleData {
+                proof_size,
+                resigned,
+            } => FecVariantShape {
+                proof_size,
+                resigned,
+            },
+        }
+    }
+
+    /// Returns normalized coding geometry, or `None` for a data shred.
+    pub fn coding_geometry(&self) -> Result<Option<CodingGeometry>, Error> {
+        match self {
+            Self::ShredData(_) => Ok(None),
+            Self::ShredCode(shred) => Ok(Some(CodingGeometry {
+                num_data: shred.num_data_shreds(),
+                num_coding: shred.num_coding_shreds(),
+                position: shred.position(),
+                first_coding_index: shred.first_coding_index().ok_or_else(|| {
+                    Error::InvalidErasureShardIndex(Box::new((self.index(), shred.position())))
+                })?,
+            })),
+        }
     }
 
     /// Unique identifier for each shred.
@@ -569,23 +864,29 @@ impl Shred {
     /// shred-type), but different payload.
     /// Retransmitter's signature is ignored when comparing payloads.
     pub fn is_shred_duplicate(&self, other: &Shred) -> bool {
-        if self.id() != other.id() {
-            return false;
-        }
-        fn get_payload(shred: &Shred) -> &[u8] {
-            let Ok(offset) = shred.retransmitter_signature_offset() else {
-                return shred.payload();
-            };
-            // Assert that the retransmitter's signature is at the very end of
-            // the shred payload.
-            debug_assert_eq!(offset + SIZE_OF_SIGNATURE, shred.payload().len());
-            shred
-                .payload()
-                .get(..offset)
-                .unwrap_or_else(|| shred.payload())
-        }
-        get_payload(self) != get_payload(other)
+        self.compare(other) == ShredComparison::ConflictingPayload
     }
+}
+
+/// Compares adjacent FEC roots within one slot.
+pub fn check_same_slot_fec_chain(
+    left: &FecSetMeta,
+    right: &FecSetMeta,
+) -> Result<bool, ShredValidationError> {
+    let (previous, next) = if left.id.fec_set_index < right.id.fec_set_index {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if previous.id.slot != next.id.slot
+        || previous
+            .num_data
+            .and_then(|num_data| previous.id.fec_set_index.checked_add(u32::from(num_data)))
+            != Some(next.id.fec_set_index)
+    {
+        return Err(ShredValidationError::NotAdjacent);
+    }
+    Ok(previous.id.merkle_root == next.chained_merkle_root)
 }
 
 impl From<merkle::Shred> for Shred {
@@ -619,18 +920,54 @@ pub fn recover<T: IntoIterator<Item = Shred>>(
     shreds: T,
     reed_solomon_cache: &ReedSolomonCache,
 ) -> Result<impl Iterator<Item = Result<Shred, Error>> + use<T>, Error> {
-    let shreds = shreds
+    let shreds = recover_validated(shreds, reed_solomon_cache).map_err(|err| match err {
+        ShredValidationError::Shred(err) => err,
+        _ => Error::InvalidRecoveredShred,
+    })?;
+    Ok(shreds.into_iter().map(Ok))
+}
+
+/// Atomically validates one coherent FEC set and eagerly recovers missing shreds.
+pub fn recover_validated<T: IntoIterator<Item = Shred>>(
+    shreds: T,
+    reed_solomon_cache: &ReedSolomonCache,
+) -> Result<Vec<Shred>, ShredValidationError> {
+    let shreds: Vec<_> = shreds.into_iter().collect();
+    let first = shreds.first().ok_or(ShredValidationError::EmptyFecSet)?;
+    let mut meta = FecSetMeta::new(first)?;
+    let mut shard_ids = std::collections::HashSet::with_capacity(shreds.len());
+    for shred in &shreds {
+        meta.check_shred(shred)?;
+        if !shard_ids.insert((shred.shred_type(), shred.index())) {
+            return Err(ShredValidationError::DuplicateErasureShard);
+        }
+    }
+    if meta.num_data.is_none() {
+        return Err(ShredValidationError::InconsistentCodingGeometry);
+    }
+    // Recheck data ranges now that coding geometry is known.
+    shreds
+        .iter()
+        .try_for_each(|shred| meta.check_index(shred))?;
+    let inner = shreds
         .into_iter()
-        .map(|shred| {
-            debug_assert!(matches!(
-                shred.common_header().shred_variant,
-                ShredVariant::MerkleCode { .. } | ShredVariant::MerkleData { .. }
-            ));
-            merkle::Shred::try_from(shred)
-        })
-        .collect::<Result<_, _>>()?;
-    let shreds = merkle::recover(shreds, reed_solomon_cache)?;
-    Ok(shreds.map(|shred| shred.map(Shred::from)))
+        .map(merkle::Shred::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let recovered = merkle::recover(inner, reed_solomon_cache)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(Shred::from)
+        .collect::<Vec<_>>();
+    let mut recovered_ids = std::collections::HashSet::with_capacity(recovered.len());
+    for shred in &recovered {
+        meta.check_shred(shred)?;
+        if shard_ids.contains(&(shred.shred_type(), shred.index()))
+            || !recovered_ids.insert((shred.shred_type(), shred.index()))
+        {
+            return Err(ShredValidationError::DuplicateErasureShard);
+        }
+    }
+    Ok(recovered)
 }
 
 impl From<ShredVariant> for ShredType {
@@ -1379,6 +1716,7 @@ mod tests {
             }
             assert!(!shred.is_shred_duplicate(&other));
             assert!(!other.is_shred_duplicate(shred));
+            assert_eq!(shred.compare(&other), ShredComparison::SamePayload);
         }
         // Shreds of the same (slot, index, shred-type) with different payload
         // (ignoring retransmitter signature) are duplicate.
@@ -1393,6 +1731,191 @@ mod tests {
             );
             assert!(shred.is_shred_duplicate(&other));
             assert!(other.is_shred_duplicate(shred));
+            assert_eq!(shred.compare(&other), ShredComparison::ConflictingPayload);
         }
+    }
+
+    fn make_toolkit_shreds(seed: [u8; 32]) -> Vec<Shred> {
+        let mut rng = ChaChaRng::from_seed(seed);
+        make_merkle_shreds_for_tests(&mut rng, 1_000_000, 1200 * 40, true)
+            .unwrap()
+            .into_iter()
+            .map(Shred::from)
+            .collect()
+    }
+
+    #[test]
+    fn test_fec_set_meta_identity_geometry_and_chain() {
+        let shreds = make_toolkit_shreds([2u8; 32]);
+        let first_fec = shreds[0].fec_set_index();
+        let second_fec = first_fec + DATA_SHREDS_PER_FEC_BLOCK as u32;
+        let first = shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() == first_fec)
+            .unwrap();
+        let first_code = shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() == first_fec && shred.is_code())
+            .unwrap();
+        let second = shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() == second_fec)
+            .unwrap();
+        let mut first_meta = FecSetMeta::new(first).unwrap();
+        first_meta.check_shred(first_code).unwrap();
+        let geometry = first_code.coding_geometry().unwrap().unwrap();
+        assert_eq!(first_meta.num_data(), Some(geometry.num_data()));
+        assert_eq!(first_meta.num_coding(), Some(geometry.num_coding()));
+        assert_eq!(
+            first_meta.first_coding_index(),
+            Some(geometry.first_coding_index())
+        );
+        assert_eq!(first_meta.proof_size(), first.variant_shape().proof_size);
+        assert_eq!(first_meta.is_resigned(), first.variant_shape().resigned);
+
+        let second_meta = FecSetMeta::new(second).unwrap();
+        assert_matches!(
+            check_same_slot_fec_chain(&first_meta, &second_meta),
+            Ok(true)
+        );
+        assert_matches!(
+            check_same_slot_fec_chain(&second_meta, &first_meta),
+            Ok(true)
+        );
+
+        let mut conflicting = first_code.payload().clone();
+        conflicting.as_mut()[SIZE_OF_CODING_SHRED_HEADERS] ^= 1;
+        let conflicting = Shred::new_from_serialized_shred_sanitized(conflicting).unwrap();
+        assert_matches!(
+            first_meta.check_shred(&conflicting),
+            Err(ShredValidationError::InconsistentIdentity)
+        );
+
+        let mut bad_geometry_meta = first_meta.clone();
+        bad_geometry_meta.num_data = Some(geometry.num_data() + 1);
+        assert_matches!(
+            bad_geometry_meta.check_shred(first_code),
+            Err(ShredValidationError::InconsistentCodingGeometry)
+        );
+        let mut bad_geometry_meta = first_meta.clone();
+        bad_geometry_meta.num_coding = Some(geometry.num_coding() + 1);
+        assert_matches!(
+            bad_geometry_meta.check_shred(first_code),
+            Err(ShredValidationError::InconsistentCodingGeometry)
+        );
+        let mut bad_geometry_meta = first_meta.clone();
+        bad_geometry_meta.first_coding_index = Some(geometry.first_coding_index() + 1);
+        assert_matches!(
+            bad_geometry_meta.check_shred(first_code),
+            Err(ShredValidationError::InconsistentCodingGeometry)
+        );
+
+        let mut bad_shape_meta = first_meta.clone();
+        bad_shape_meta.variant_shape.proof_size ^= 1;
+        assert_matches!(
+            bad_shape_meta.check_shred(first),
+            Err(ShredValidationError::InconsistentVariantShape)
+        );
+
+        let mut bad_version = first.payload().clone();
+        bad_version.as_mut()[OFFSET_OF_SHRED_INDEX + SIZE_OF_SHRED_INDEX] ^= 1;
+        let bad_version = Shred::new_from_serialized_shred_sanitized(bad_version).unwrap();
+        assert_matches!(
+            first_meta.check_shred(&bad_version),
+            Err(ShredValidationError::InconsistentIdentity)
+        );
+
+        assert_matches!(
+            first_meta.check_shred(second),
+            Err(ShredValidationError::DifferentFecSet)
+        );
+        assert_eq!(first.compare(second), ShredComparison::DifferentId);
+    }
+
+    #[test]
+    fn test_fec_chain_conflict_both_orders() {
+        let shreds = make_toolkit_shreds([3u8; 32]);
+        let first_fec = shreds[0].fec_set_index();
+        let second_fec = first_fec + DATA_SHREDS_PER_FEC_BLOCK as u32;
+        let second = shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() == second_fec)
+            .unwrap();
+        let first_code = shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() == first_fec && shred.is_code())
+            .unwrap();
+        let first_meta = FecSetMeta::new(first_code).unwrap();
+        let mut second_meta = FecSetMeta::new(second).unwrap();
+        second_meta.chained_merkle_root = Hash::new_unique();
+        assert_matches!(
+            check_same_slot_fec_chain(&first_meta, &second_meta),
+            Ok(false)
+        );
+        assert_matches!(
+            check_same_slot_fec_chain(&second_meta, &first_meta),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn test_validated_recovery_and_invalid_inputs() {
+        let shreds = make_toolkit_shreds([4u8; 32]);
+        let fec_set_index = shreds[0].fec_set_index();
+        let batch: Vec<_> = shreds
+            .iter()
+            .filter(|shred| shred.fec_set_index() == fec_set_index)
+            .cloned()
+            .collect();
+        let missing = batch.iter().find(|shred| shred.is_data()).unwrap().clone();
+        let available: Vec<_> = batch
+            .iter()
+            .filter(|shred| shred.id() != missing.id())
+            .take(DATA_SHREDS_PER_FEC_BLOCK)
+            .cloned()
+            .collect();
+        let recovered = recover_validated(available, &ReedSolomonCache::default()).unwrap();
+        let recovered_missing = recovered
+            .iter()
+            .find(|shred| shred.id() == missing.id())
+            .unwrap();
+        assert_eq!(
+            recovered_missing.compare(&missing),
+            ShredComparison::SamePayload
+        );
+
+        let next = shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() != fec_set_index)
+            .unwrap()
+            .clone();
+        let mut mixed = batch
+            .into_iter()
+            .take(DATA_SHREDS_PER_FEC_BLOCK)
+            .collect::<Vec<_>>();
+        mixed.push(next);
+        assert_matches!(
+            recover_validated(mixed, &ReedSolomonCache::default()),
+            Err(ShredValidationError::DifferentFecSet)
+        );
+        assert_matches!(
+            recover_validated(Vec::new(), &ReedSolomonCache::default()),
+            Err(ShredValidationError::EmptyFecSet)
+        );
+        assert_matches!(
+            recover_validated(
+                vec![available_shred(&shreds, fec_set_index); 2],
+                &ReedSolomonCache::default()
+            ),
+            Err(ShredValidationError::DuplicateErasureShard)
+        );
+    }
+
+    fn available_shred(shreds: &[Shred], fec_set_index: u32) -> Shred {
+        shreds
+            .iter()
+            .find(|shred| shred.fec_set_index() == fec_set_index)
+            .unwrap()
+            .clone()
     }
 }

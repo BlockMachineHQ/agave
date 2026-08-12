@@ -276,6 +276,10 @@ impl ShredCode {
         self.coding_header.num_coding_shreds
     }
 
+    pub(super) fn position(&self) -> u16 {
+        self.coding_header.position
+    }
+
     pub(super) fn erasure_mismatch(&self, other: &ShredCode) -> bool {
         let CodingShredHeader {
             num_data_shreds,
