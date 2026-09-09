@@ -91,22 +91,137 @@ fn unpack_archive<'a, C>(
     apparent_limit_size: u64,
     actual_limit_size: u64,
     limit_count: u64,
-    mut entry_checker: C, // checks if entry is valid
+    entry_checker: C, // checks if entry is valid
 ) -> Result<()>
 where
     C: FnMut(&[&str], tar::EntryType) -> UnpackPath<'a>,
+{
+    let mut total_entries = 0;
+    let mut open_dirs = Vec::new();
+    visit_archive(
+        input,
+        apparent_limit_size,
+        actual_limit_size,
+        limit_count,
+        entry_checker,
+        |entry, path, parts, unpack_dir| {
+            let account_filename = match parts {
+                ["accounts", account_filename] => Some(PathBuf::from(account_filename)),
+                _ => None,
+            };
+            // Account destinations already name the accounts directory.
+            let entry_path = sanitize_path_and_open_dir(
+                account_filename.as_deref().unwrap_or(path),
+                unpack_dir,
+                &mut open_dirs,
+            )?;
+            let Some((entry_path, open_dir)) = entry_path else {
+                return Ok(());
+            };
+            let unpack = unpack_entry(&mut file_creator, entry, entry_path, open_dir);
+            check_unpack_result(unpack, path.display().to_string())?;
+            total_entries += 1;
+            Ok(())
+        },
+    )?;
+    file_creator.drain()?;
+    info!("unpacked {total_entries} entries total");
+    Ok(())
+}
+
+/// Metadata admitted by the native snapshot archive policy.
+#[derive(Debug)]
+pub struct SnapshotArchiveEntry<'a> {
+    pub path: &'a Path,
+    pub kind: tar::EntryType,
+    /// Header size including GNU sparse holes (charged against 64 TiB).
+    pub apparent_size: u64,
+    /// Header's stored payload size excluding GNU sparse holes (charged against 4 TiB).
+    /// This excludes tar headers, sparse extension headers, and block padding.
+    pub actual_size: u64,
+    /// Effective logical reader length from tar, including sparse holes and PAX size overrides.
+    /// Native admission charges the header sizes above, not this value.
+    pub reader_size: u64,
+}
+
+/// Visit a decompressed snapshot tar stream using the native unpacker's admission policy.
+/// A streaming zstd decoder can be passed directly as `input`; no files or seeking are needed.
+///
+/// Paths, entry kinds, and filenames are checked before invoking `consumer`. Cumulative
+/// header sizes are limited to 64 TiB apparent and 4 TiB stored, and the number of admitted
+/// entries (including directories and duplicates) to 5,000,000, inclusively. GNU sparse
+/// maps are interpreted and checked by the same tar iterator as native unpacking; the
+/// entry reader yields logical content, including zero-filled holes, not stored extents.
+/// As in native unpacking, PAX size overrides can make `reader_size` differ from the charged
+/// header sizes; these limits are not a bound on all bytes yielded or extension-record bytes.
+///
+/// Entries arrive in archive order. Duplicate names and leading-zero numeric names are
+/// accepted, just as in native unpacking. This is archive admission, not snapshot-content
+/// validation: it does not require particular files, compare numeric path components,
+/// parse version contents, authenticate an image, or hash accounts. Consumers must apply
+/// their content requirements and only publish success after this function succeeds.
+///
+/// Unread file content is drained after a successful callback; directories are skipped as
+/// in native unpacking. Tar parsing, EOF, extension records, and trailing data retain the
+/// pinned tar crate's semantics, not a stricter independent framing policy. Callback and
+/// content-read errors stop immediately and receive the native `failed to unpack` context;
+/// earlier consumer side effects are not rolled back.
+pub fn visit_snapshot_archive<R: Read>(
+    input: R,
+    mut consumer: impl FnMut(SnapshotArchiveEntry<'_>, &mut dyn Read) -> Result<()>,
+) -> Result<()> {
+    visit_archive(
+        input,
+        MAX_SNAPSHOT_ARCHIVE_UNPACKED_APPARENT_SIZE,
+        MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE,
+        MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT,
+        |parts, kind| {
+            if is_valid_snapshot_archive_entry(parts, kind) {
+                UnpackPath::Valid(Path::new(""))
+            } else {
+                UnpackPath::Invalid
+            }
+        },
+        |mut entry, path, _, _| {
+            let kind = entry.header().entry_type();
+            let metadata = SnapshotArchiveEntry {
+                path,
+                kind,
+                apparent_size: entry.header().size()?,
+                actual_size: entry.header().entry_size()?,
+                reader_size: entry.size(),
+            };
+            let result = consumer(metadata, &mut entry).and_then(|()| {
+                if kind != Directory {
+                    io::copy(&mut entry, &mut io::sink())?;
+                }
+                Ok(())
+            });
+            check_unpack_result(result, path.display().to_string())
+        },
+    )
+}
+
+fn visit_archive<'a, R: Read, C, F>(
+    input: R,
+    apparent_limit_size: u64,
+    actual_limit_size: u64,
+    limit_count: u64,
+    mut entry_checker: C,
+    mut consumer: F,
+) -> Result<()>
+where
+    C: FnMut(&[&str], tar::EntryType) -> UnpackPath<'a>,
+    F: FnMut(tar::Entry<'_, R>, &Path, &[&str], &Path) -> Result<()>,
 {
     let mut apparent_total_size: u64 = 0;
     let mut actual_total_size: u64 = 0;
     let mut total_count: u64 = 0;
 
-    let mut total_entries = 0;
-    let mut open_dirs = Vec::new();
-
     let mut archive = Archive::new(input);
     for entry in archive.entries()? {
         let entry = entry?;
-        let path = entry.path()?;
+        let path = entry.path()?.into_owned();
         let path_str = path.display().to_string();
 
         // Although the `tar` crate safely skips at the actual unpacking, fail
@@ -159,31 +274,8 @@ where
         )?;
         total_count = checked_total_count_increment(total_count, limit_count)?;
 
-        let account_filename = match parts.as_slice() {
-            ["accounts", account_filename] => Some(PathBuf::from(account_filename)),
-            _ => None,
-        };
-        let entry_path = if let Some(account) = account_filename {
-            // Special case account files. We're unpacking an account entry inside one of the
-            // account_paths returned by `entry_checker`. We want to unpack into
-            // account_path/<account> instead of account_path/accounts/<account> so we strip the
-            // accounts/ prefix.
-            sanitize_path_and_open_dir(&account, unpack_dir, &mut open_dirs)
-        } else {
-            sanitize_path_and_open_dir(&path, unpack_dir, &mut open_dirs)
-        }?; // ? handles file system errors
-        let Some((entry_path, open_dir)) = entry_path else {
-            continue; // skip it
-        };
-
-        let unpack = unpack_entry(&mut file_creator, entry, entry_path, open_dir);
-        check_unpack_result(unpack, path_str)?;
-
-        total_entries += 1;
+        consumer(entry, &path, &parts, unpack_dir)?;
     }
-    file_creator.drain()?;
-
-    info!("unpacked {total_entries} entries total");
     Ok(())
 }
 
@@ -462,6 +554,340 @@ mod tests {
     };
 
     const MAX_GENESIS_SIZE_FOR_TESTS: u64 = 1024;
+
+    fn fixture_entry(path: &[u8], kind: tar::EntryType, apparent: u64, data: &[u8]) -> Vec<u8> {
+        let mut header = Header::new_gnu();
+        header.as_old_mut().name[..path.len()].copy_from_slice(path);
+        header.set_entry_type(kind);
+        header.set_mode(0o644);
+        header.set_size(apparent);
+        if kind == GNUSparse {
+            header.set_size(data.len() as u64);
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.set_real_size(apparent);
+            gnu.sparse[0].set_offset(apparent - data.len() as u64);
+            gnu.sparse[0].set_length(data.len() as u64);
+        }
+        header.set_cksum();
+        let mut archive = Builder::new(Vec::new());
+        archive.append(&header, data).unwrap();
+        archive.into_inner().unwrap()
+    }
+
+    fn native_fixture(data: &[u8], dst: &Path) -> Result<()> {
+        let creator = file_creator(0, &IoSetupState::default(), |info| Some(info.file))?;
+        streaming_unpack_snapshot(data, creator, dst, &[dst.join("accounts")])
+    }
+
+    fn compare_fixture(data: &[u8]) -> Result<()> {
+        let dst = tempfile::tempdir().unwrap();
+        let native = native_fixture(data, dst.path());
+        let visitor = visit_snapshot_archive(data, |_, reader| {
+            io::copy(reader, &mut io::sink())?;
+            Ok(())
+        });
+        assert_eq!(
+            native.as_ref().err().map(ToString::to_string),
+            visitor.as_ref().err().map(ToString::to_string),
+        );
+        visitor
+    }
+
+    #[test]
+    fn test_shared_visitor_grammar_and_kinds() {
+        for (path, kind) in [
+            ("version", Regular),
+            ("accounts", Directory),
+            ("accounts/001.02", Regular),
+            ("snapshots", Directory),
+            ("snapshots/001", Directory),
+            // Native grammar does not require equal numeric components.
+            ("snapshots/001/02", Regular),
+            ("snapshots/status_cache", Regular),
+            ("accounts//1.2", Regular),
+            ("accounts/./1.2", Regular),
+        ] {
+            compare_fixture(&fixture_entry(path.as_bytes(), kind, 0, b"")).unwrap();
+        }
+        for path in [
+            "unknown",
+            "accounts/1.2.3",
+            "accounts/+1.2",
+            "accounts/1.+2",
+            "accounts/1.",
+            "accounts/.2",
+            "accounts/1.2/nested",
+            "accounts_hardlinks/1.2",
+            "snapshots/1/status_cache",
+            "snapshots/+1/1",
+            "./version",
+            "/version",
+            "accounts/../version",
+            "version/",
+        ] {
+            assert!(
+                compare_fixture(&fixture_entry(path.as_bytes(), Regular, 0, b"")).is_err(),
+                "{path}"
+            );
+        }
+        assert!(compare_fixture(&fixture_entry(b"accounts/\xff.1", Regular, 0, b"")).is_err());
+        for kind in [
+            tar::EntryType::Link,
+            tar::EntryType::Symlink,
+            tar::EntryType::Continuous,
+            tar::EntryType::Fifo,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            Directory,
+        ] {
+            assert!(compare_fixture(&fixture_entry(b"accounts/1.2", kind, 0, b"")).is_err());
+        }
+    }
+
+    #[test]
+    fn test_shared_visitor_sparse_and_duplicates() {
+        for path in [
+            b"accounts/1.2".as_slice(),
+            b"snapshots/status_cache",
+            b"snapshots/1/2",
+        ] {
+            let data = fixture_entry(path, GNUSparse, 1028, b"data");
+            compare_fixture(&data).unwrap();
+            let dst = tempfile::tempdir().unwrap();
+            native_fixture(&data, dst.path()).unwrap();
+            visit_snapshot_archive(data.as_slice(), |metadata, reader| {
+                assert_eq!(metadata.kind, GNUSparse);
+                assert_eq!(metadata.apparent_size, 1028);
+                assert_eq!(metadata.actual_size, 4);
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                assert_eq!(&bytes[..1024], &[0; 1024]);
+                assert_eq!(&bytes[1024..], b"data");
+                assert_eq!(bytes, fs::read(dst.path().join(metadata.path))?);
+                Ok(())
+            })
+            .unwrap();
+            let mut malformed = data;
+            let header = Header::from_byte_slice(&malformed[..512]);
+            let mut header = header.clone();
+            header.as_gnu_mut().unwrap().set_real_size(1029);
+            header.set_cksum();
+            malformed[..512].copy_from_slice(header.as_bytes());
+            assert!(compare_fixture(&malformed).is_err());
+        }
+        let mut data = fixture_entry(b"version", Regular, 3, b"one");
+        data.truncate(1024);
+        data.extend(fixture_entry(b"version", Regular, 3, b"two"));
+        compare_fixture(&data).unwrap();
+        let mut seen = Vec::new();
+        visit_snapshot_archive(data.as_slice(), |_, reader| {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            seen.push(bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, [b"one", b"two"]);
+        let dst = tempfile::tempdir().unwrap();
+        native_fixture(&data, dst.path()).unwrap();
+        assert_eq!(fs::read(dst.path().join("version")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn test_shared_visitor_truncation_and_sizes() {
+        for kind in [Regular, GNUSparse] {
+            let data = fixture_entry(b"accounts/1.2", kind, 1028, &[1; 1028]);
+            for end in [1, 511, 512, 513, 1024] {
+                assert!(compare_fixture(&data[..end]).is_err(), "{kind:?} at {end}");
+                // A consumer cannot bypass checking the remainder by ignoring it.
+                assert!(visit_snapshot_archive(&data[..end], |_, _| Ok(())).is_err());
+            }
+        }
+        for size in [
+            MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE + 1,
+            MAX_SNAPSHOT_ARCHIVE_UNPACKED_APPARENT_SIZE + 1,
+            u64::MAX - 511,
+        ] {
+            assert!(compare_fixture(&fixture_entry(b"version", Regular, size, b"")).is_err());
+        }
+        assert!(
+            compare_fixture(&fixture_entry(
+                b"accounts/1.2",
+                GNUSparse,
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_APPARENT_SIZE + 1,
+                b"x"
+            ))
+            .is_err()
+        );
+        assert!(
+            checked_total_size_sum(u64::MAX - 1, 8, MAX_SNAPSHOT_ARCHIVE_UNPACKED_APPARENT_SIZE)
+                .is_err()
+        );
+        assert_eq!(
+            checked_total_count_increment(
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT - 1,
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT
+            )
+            .unwrap(),
+            MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT
+        );
+        assert!(
+            checked_total_count_increment(
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT,
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_COUNT
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_shared_visitor_limit_boundaries() {
+        let mut data = fixture_entry(b"accounts/1.2", GNUSparse, 1028, b"data");
+        data.truncate(1024);
+        data.extend(fixture_entry(b"accounts/1.2", GNUSparse, 1028, b"data"));
+        // Small private limits exercise cumulative admission without multi-TiB fixtures.
+        for (apparent, actual, count, accepted) in [
+            (2056, 8, 2, true),
+            (2055, 8, 2, false),
+            (2056, 7, 2, false),
+            (2056, 8, 1, false),
+        ] {
+            let dst = tempfile::tempdir().unwrap();
+            let checker = |_: &[&str], _| UnpackPath::Valid(dst.path());
+            let creator =
+                file_creator(0, &IoSetupState::default(), |info| Some(info.file)).unwrap();
+            let native = unpack_archive(data.as_slice(), creator, apparent, actual, count, checker);
+            let visitor = visit_archive(
+                data.as_slice(),
+                apparent,
+                actual,
+                count,
+                checker,
+                |mut entry, _, _, _| {
+                    io::copy(&mut entry, &mut io::sink())?;
+                    Ok(())
+                },
+            );
+            assert_eq!(native.is_ok(), accepted);
+            assert_eq!(
+                native.err().map(|e| e.to_string()),
+                visitor.err().map(|e| e.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_visitor_pax_size_preserves_native_accounting() {
+        let mut archive = Builder::new(Vec::new());
+        archive
+            .append_pax_extensions([("size", b"4".as_slice())])
+            .unwrap();
+        let mut header = Header::new_gnu();
+        header.set_path("version").unwrap();
+        header.set_mode(0o644);
+        header.set_size(1);
+        header.set_cksum();
+        archive.append(&header, b"data".as_slice()).unwrap();
+        let data = archive.into_inner().unwrap();
+        compare_fixture(&data).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        native_fixture(&data, dst.path()).unwrap();
+        assert_eq!(fs::read(dst.path().join("version")).unwrap(), b"data");
+        visit_snapshot_archive(data.as_slice(), |entry, reader| {
+            assert_eq!(entry.apparent_size, 1);
+            assert_eq!(entry.actual_size, 1);
+            assert_eq!(entry.reader_size, 4);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            assert_eq!(bytes, b"data");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_shared_visitor_sparse_extensions_and_overflow() {
+        let data = fixture_entry(b"accounts/1.2", GNUSparse, 1028, b"data");
+        let mut header = Header::from_byte_slice(&data[..512]).clone();
+        let mut ext = tar::GnuExtSparseHeader::new();
+        std::mem::swap(
+            &mut ext.sparse_mut()[0],
+            &mut header.as_gnu_mut().unwrap().sparse[0],
+        );
+        header.as_gnu_mut().unwrap().set_is_extended(true);
+        header.set_cksum();
+        let mut extended = header.as_bytes().to_vec();
+        extended.extend_from_slice(ext.as_bytes());
+        extended.extend_from_slice(&data[512..]);
+        compare_fixture(&extended).unwrap();
+        assert!(compare_fixture(&extended[..700]).is_err());
+
+        for (offset, length, apparent, actual) in [
+            (u64::MAX, 1, u64::MAX, 1), // sparse extent arithmetic overflow
+            (1024, 5, 1029, 4),         // extents exceed stored size
+            (1024, 3, 1027, 4),         // stored bytes not covered by extents
+            (
+                0,
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE + 1,
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE + 1,
+                MAX_SNAPSHOT_ARCHIVE_UNPACKED_ACTUAL_SIZE + 1,
+            ),
+        ] {
+            let mut header = Header::from_byte_slice(&data[..512]).clone();
+            header.set_size(actual);
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.set_real_size(apparent);
+            gnu.sparse[0].set_offset(offset);
+            gnu.sparse[0].set_length(length);
+            header.set_cksum();
+            assert!(compare_fixture(header.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn test_shared_visitor_downstream_error() {
+        struct FailingCreator;
+        impl FileCreator for FailingCreator {
+            fn schedule_create_at_dir(
+                &mut self,
+                _: PathBuf,
+                _: u32,
+                _: Arc<File>,
+                _: &mut dyn Read,
+            ) -> io::Result<()> {
+                Err(io::Error::other("consumer stopped"))
+            }
+            fn file_complete(&mut self, _: File, _: PathBuf, _: u64) {
+                unreachable!()
+            }
+            fn drain(&mut self) -> io::Result<()> {
+                panic!("must not drain after failure")
+            }
+        }
+        let mut data = fixture_entry(b"version", Regular, 1, b"x");
+        data.truncate(1024);
+        data.extend(fixture_entry(b"unknown", Regular, 0, b""));
+        let dst = tempfile::tempdir().unwrap();
+        let native = streaming_unpack_snapshot(
+            data.as_slice(),
+            Box::new(FailingCreator),
+            dst.path(),
+            &[dst.path().to_path_buf()],
+        )
+        .unwrap_err();
+        let mut calls = 0;
+        let visitor = visit_snapshot_archive(data.as_slice(), |_, _| {
+            calls += 1;
+            Err(io::Error::other("consumer stopped").into())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(native.to_string(), visitor.to_string());
+        assert_eq!(
+            visitor.to_string(),
+            "Archive error: failed to unpack \"version\": IO error: consumer stopped"
+        );
+    }
 
     #[test]
     fn test_archive_is_valid_entry() {
