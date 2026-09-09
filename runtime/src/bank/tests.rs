@@ -6839,6 +6839,89 @@ fn test_adjust_sysvar_balance_for_rent() {
 }
 
 #[test]
+fn test_sysvar_updates_same_bank_capitalization() {
+    let bank = create_simple_test_bank(0);
+    let id = Pubkey::new_unique();
+    let initial_cap = bank.capitalization();
+    for (len, balance) in [(0, 0), (0, 0), (37, 0), (37, 0), (1, 10_000_000), (1, 0)] {
+        bank.update_sysvar_account(&id, |old| {
+            let (lamports, _) = bank.inherit_specially_retained_account_fields(old);
+            let mut new =
+                AccountSharedData::new(lamports.max(balance), len, &solana_sdk_ids::sysvar::id());
+            new.set_rent_epoch(937);
+            new
+        });
+        let account = bank.get_account(&id).unwrap();
+        assert_eq!(bank.capitalization(), initial_cap + account.lamports());
+        assert_eq!(account.rent_epoch(), 937);
+    }
+    // The native store still accounts for decreases, without counting a repeated write twice.
+    let mut account = bank.get_account(&id).unwrap();
+    account.set_lamports(1);
+    for _ in 0..2 {
+        bank.store_account_and_update_capitalization(&id, &account);
+        assert_eq!(bank.capitalization(), initial_cap + 1);
+    }
+}
+
+#[test_case(false; "reductions")]
+#[test_case(true; "reductions_and_safeguard")]
+#[allow(deprecated)]
+fn test_sysvar_updates_intermediate_rent_funding(safeguard: bool) {
+    let (mut genesis_config, _) = create_genesis_config(1_000_000);
+    genesis_config.rent = Rent::free();
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    let mut gates = vec![
+        feature_set::deprecate_rent_exemption_threshold::id(),
+        feature_set::set_lamports_per_byte_to_6333::id(),
+        feature_set::set_lamports_per_byte_to_696::id(),
+    ];
+    if safeguard {
+        gates.push(feature_set::set_lamports_per_byte_to_6960::id());
+    }
+    for id in gates {
+        assert!(!bank.feature_set.is_active(&id));
+        bank.store_account(
+            &id,
+            &feature::create_account(&Feature { activated_at: None }, 1),
+        );
+    }
+    // An underfunded sysvar makes the first intermediate update observable even when
+    // the final safeguard is selected: deprecation produces 15000, not 6960.
+    bank.rent_collector.rent.lamports_per_byte = 10_000;
+    bank.rent_collector.rent.exemption_threshold = 1.5f64.to_le_bytes();
+    let mut old = bank.get_account(&Rent::id()).unwrap();
+    old.set_rent_epoch(937);
+    bank.store_account(&Rent::id(), &old);
+    let initial_cap = bank.capitalization();
+    let peak = Rent {
+        lamports_per_byte: 15_000,
+        exemption_threshold: 1.0f64.to_le_bytes(),
+        burn_percent: 50,
+    }
+    .minimum_balance(old.data().len());
+
+    bank.compute_and_apply_new_feature_activations();
+    let account = bank.get_account(&Rent::id()).unwrap();
+    assert_eq!(account.lamports(), peak);
+    assert_eq!(account.rent_epoch(), 937);
+    assert_eq!(bank.capitalization(), initial_cap + peak - old.lamports());
+    assert_eq!(
+        bank.rent_collector.rent.lamports_per_byte,
+        if safeguard { 6960 } else { 696 }
+    );
+    assert_eq!(
+        bincode::deserialize::<Rent>(account.data()).unwrap(),
+        bank.rent_collector.rent
+    );
+    let cap = bank.capitalization();
+    bank.compute_and_apply_new_feature_activations();
+    bank.update_rent();
+    assert_eq!(bank.capitalization(), cap);
+    assert_eq!(bank.get_account(&Rent::id()).unwrap(), account);
+}
+
+#[test]
 fn test_update_clock_timestamp() {
     let leader_pubkey = solana_pubkey::new_rand();
     let GenesisConfigInfo {

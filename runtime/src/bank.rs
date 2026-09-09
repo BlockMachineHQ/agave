@@ -112,8 +112,8 @@ use {
     },
     solana_builtins::{BUILTINS, STATELESS_BUILTINS},
     solana_clock::{
-        BankId, Epoch, INITIAL_RENT_EPOCH, MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY,
-        Slot, SlotIndex, UnixTimestamp,
+        BankId, Epoch, MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY, Slot, SlotIndex,
+        UnixTimestamp,
     },
     solana_cluster_type::ClusterType,
     solana_compute_budget::compute_budget::ComputeBudget,
@@ -2373,18 +2373,7 @@ impl Bank {
         &self,
         old_account: &Option<AccountSharedData>,
     ) -> InheritableAccountFields {
-        const RENT_UNADJUSTED_INITIAL_BALANCE: u64 = 1;
-
-        (
-            old_account
-                .as_ref()
-                .map(|a| a.lamports())
-                .unwrap_or(RENT_UNADJUSTED_INITIAL_BALANCE),
-            old_account
-                .as_ref()
-                .map(|a| a.rent_epoch())
-                .unwrap_or(INITIAL_RENT_EPOCH),
-        )
+        crate::sysvar_updates::inherit_specially_retained_account_fields(old_account.as_ref())
     }
 
     pub fn clock(&self) -> sysvar::clock::Clock {
@@ -6107,53 +6096,12 @@ impl Bank {
             Arc::new(reserved_keys)
         };
 
-        if new_feature_activations.contains(&feature_set::deprecate_rent_exemption_threshold::id())
-        {
-            self.rent_collector.deprecate_rent_exemption_threshold();
-            self.update_rent();
-        }
-
-        // SIMD-0437 feature gates: all assume rent exemption threshold has been deprecated
-        // (SIMD-0194), so rent.lamports_per_byte can be set directly. These gates are
-        // expected to activate in order; if multiple activate in one epoch, the lowest
-        // activated lamports_per_byte value will be used. If features are activated out of
-        // order, the most recently activated value will be used.
-        let rent_feature_gates = [
-            (
-                feature_set::set_lamports_per_byte_to_6333::id(),
-                feature_set::set_lamports_per_byte_to_6333::LAMPORTS_PER_BYTE,
-            ),
-            (
-                feature_set::set_lamports_per_byte_to_5080::id(),
-                feature_set::set_lamports_per_byte_to_5080::LAMPORTS_PER_BYTE,
-            ),
-            (
-                feature_set::set_lamports_per_byte_to_2575::id(),
-                feature_set::set_lamports_per_byte_to_2575::LAMPORTS_PER_BYTE,
-            ),
-            (
-                feature_set::set_lamports_per_byte_to_1322::id(),
-                feature_set::set_lamports_per_byte_to_1322::LAMPORTS_PER_BYTE,
-            ),
-            (
-                feature_set::set_lamports_per_byte_to_696::id(),
-                feature_set::set_lamports_per_byte_to_696::LAMPORTS_PER_BYTE,
-            ),
-        ];
-        for (feature_id, lamports_per_byte) in rent_feature_gates {
-            if new_feature_activations.contains(&feature_id) {
-                self.rent_collector.rent.lamports_per_byte = lamports_per_byte;
-                self.update_rent();
-            }
-        }
-
-        // SIMD-0438 feature gate: reset lamports per byte to legacy value of 6960. Safeguard
-        // intended to be activated if rent reduction causes issues in the cluster.
-        // Note: if this is activated in the same epoch as a 437 feature gate (above), the
-        // safeguard must override it.
-        if new_feature_activations.contains(&feature_set::set_lamports_per_byte_to_6960::id()) {
-            self.rent_collector.rent.lamports_per_byte =
-                feature_set::set_lamports_per_byte_to_6960::LAMPORTS_PER_BYTE;
+        let rent_updates = crate::sysvar_updates::rent_activation_updates(
+            &self.rent_collector.rent,
+            |feature_id| new_feature_activations.contains(feature_id),
+        );
+        for rent in rent_updates {
+            self.rent_collector.rent = rent;
             self.update_rent();
         }
 
@@ -6282,10 +6230,7 @@ impl Bank {
     }
 
     fn adjust_sysvar_balance_for_rent(&self, account: &mut AccountSharedData) {
-        account.set_lamports(
-            self.get_minimum_balance_for_rent_exemption(account.data().len())
-                .max(account.lamports()),
-        );
+        crate::sysvar_updates::adjust_sysvar_balance_for_rent(&self.rent_collector.rent, account);
     }
 
     /// Compute the active feature set based on the current bank state,
