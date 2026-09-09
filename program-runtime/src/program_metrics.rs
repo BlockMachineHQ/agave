@@ -99,6 +99,10 @@ impl ProgramStatistics {
     }
 
     pub fn merge_from(&self, other: &ProgramStatistics) {
+        // Unloaded entries share statistics with their retained compiled entry.
+        if std::ptr::eq(self, other) {
+            return;
+        }
         let ord = Ordering::Relaxed;
         self.uses.fetch_add(other.uses.load(ord), ord);
         let other_compilations = other.compilations.load(ord);

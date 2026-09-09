@@ -87,6 +87,7 @@ fn program_cache_execution(threads: usize) {
                     &mut ExecuteTimings::default(),
                     true,
                     true,
+                    None,
                 );
                 for key in programs.iter() {
                     let cache_entry = result.find(key);

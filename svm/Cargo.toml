@@ -103,6 +103,7 @@ solana-program-runtime = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
 solana-sdk-ids = { workspace = true }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 solana-svm-callback = { workspace = true }
 solana-svm-feature-set = { workspace = true }
 solana-svm-log-collector = { workspace = true }
@@ -151,8 +152,8 @@ solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-signer = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
-solana-svm = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils", "svm-internal"] }
-solana-syscalls = { path = "../syscalls", features = ["agave-unstable-api"] }
+solana-svm = { path = ".", default-features = false, features = ["agave-unstable-api", "dev-context-only-utils", "svm-internal"] }
+solana-syscalls = { path = "../syscalls", default-features = false, features = ["agave-unstable-api"] }
 solana-system-program = { path = "../programs/system", features = ["agave-unstable-api"] }
 solana-system-transaction = { workspace = true }
 solana-sysvar = { workspace = true }

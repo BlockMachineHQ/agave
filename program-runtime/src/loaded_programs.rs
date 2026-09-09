@@ -1064,6 +1064,37 @@ pub(crate) mod tests {
         unloaded
     }
 
+    #[test]
+    fn test_unloaded_recovery_preserves_shared_statistics() {
+        let mut cache = ProgramCache::<TestForkGraph>::new(0);
+        let env = get_mock_program_runtime_environment();
+        let key = Pubkey::new_unique();
+        let loaded = new_test_entry_with_usage(0, 1, ProgramStatistics::default());
+        loaded.stats.uses.store(7, Ordering::Relaxed);
+        loaded.stats.jit_compiled(123);
+        loaded.stats.jit_executed(45);
+        loaded.stats.interpreter_executed(67);
+        let before = format!("{:?}", loaded.stats);
+        let unloaded = Arc::new(loaded.to_unloaded().unwrap());
+        assert!(Arc::ptr_eq(&loaded.stats, &unloaded.stats));
+        assert!(!cache.assign_program(&env, key, 0, unloaded));
+        assert!(!cache.assign_program(&env, key, 0, loaded.clone()));
+        assert_eq!(format!("{:?}", loaded.stats), before);
+        let distinct = ProgramStatistics::default();
+        distinct.uses.store(3, Ordering::Relaxed);
+        distinct.jit_compiled(123);
+        loaded.stats.merge_from(&distinct);
+        assert_eq!(loaded.stats.uses.load(Ordering::Relaxed), 10);
+        assert_eq!(loaded.stats.compilations.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            loaded
+                .stats
+                .total_compilation_time_us
+                .load(Ordering::Relaxed),
+            246
+        );
+    }
+
     fn num_matching_entries<P, FG>(cache: &ProgramCache<FG>, predicate: P) -> usize
     where
         P: Fn(&ProgramCacheEntryType) -> bool,

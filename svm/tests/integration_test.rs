@@ -26,7 +26,8 @@ use {
         execution_budget::{
             MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES, SVMTransactionExecutionAndFeeBudgetLimits,
         },
-        loaded_programs::ProgramRuntimeEnvironments,
+        loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
+        program_cache_entry::ProgramCacheEntry,
     },
     solana_pubkey::Pubkey,
     solana_sdk_ids::{
@@ -38,6 +39,10 @@ use {
             CheckedTransactionDetails, TRANSACTION_ACCOUNT_BASE_SIZE, TransactionCheckResult,
         },
         nonce_info::NonceInfo,
+        program_loader::{
+            ProgramAccountIdentity, ProgramLoadCache, VerifiedProgramReceipt,
+            load_program_with_pubkey_and_cache,
+        },
         transaction_execution_result::TransactionExecutionDetails,
         transaction_processing_result::{
             ProcessedTransaction, TransactionProcessingResult,
@@ -50,6 +55,7 @@ use {
         },
     },
     solana_svm_feature_set::SVMFeatureSet,
+    solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::{
         instruction::SVMInstruction,
         svm_message::{SVMMessage, SVMStaticMessage},
@@ -61,12 +67,195 @@ use {
     solana_transaction::{Transaction, sanitized::SanitizedTransaction},
     solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
-    std::{collections::HashMap, num::NonZeroU32, slice, sync::atomic::Ordering},
+    std::{
+        collections::HashMap,
+        num::NonZeroU32,
+        slice,
+        sync::{Mutex, atomic::Ordering},
+    },
     test_case::test_case,
 };
 
 // This module contains the implementation of TransactionProcessingCallback
 mod mock_bank;
+
+#[derive(Default)]
+struct ReceiptCache(Mutex<Vec<(VerifiedProgramReceipt, Arc<ProgramCacheEntry>)>>);
+impl ProgramLoadCache for ReceiptCache {
+    fn lookup(
+        &self,
+        _: &ProgramAccountIdentity,
+        _: &ProgramRuntimeEnvironment,
+    ) -> Option<VerifiedProgramReceipt> {
+        self.0
+            .lock()
+            .unwrap()
+            .first()
+            .map(|(receipt, _)| receipt.clone())
+    }
+    fn on_load(&self, receipt: &VerifiedProgramReceipt) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((receipt.clone(), receipt.entry().unwrap()));
+    }
+}
+#[test_case(false, false, false; "unchanged_pointer_hit")]
+#[test_case(true, false, false; "prior_authority_write_cold_load")]
+#[test_case(false, true, false; "resolved_slot_history_override")]
+#[test_case(false, false, true; "unloaded_shared_statistics")]
+fn verified_program_receipt_respects_batch_writes(
+    prior_write: bool,
+    override_account: bool,
+    unloaded: bool,
+) {
+    let cache = ReceiptCache::default();
+    let payer = Keypair::new();
+    let program = if override_account {
+        solana_sdk_ids::sysvar::slot_history::id()
+    } else {
+        program_address("hello-solana")
+    };
+    let mut test_entry = SvmTestEntry::default();
+    test_entry
+        .initial_programs
+        .push(("hello-solana".to_string(), 0, Some(payer.pubkey())));
+    test_entry.add_initial_account(
+        payer.pubkey(),
+        &AccountSharedData::new(10 * LAMPORTS_PER_SOL, 0, &system_program::id()),
+    );
+    if prior_write {
+        test_entry.push_transaction(Transaction::new_signed_with_payer(
+            &[loaderv3_instruction::set_upgrade_authority(
+                &program,
+                &payer.pubkey(),
+                Some(&Pubkey::new_unique()),
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            LAST_BLOCKHASH,
+        ));
+    }
+    test_entry.push_transaction(Transaction::new_signed_with_payer(
+        &[Instruction::new_with_bytes(program, &[], vec![])],
+        Some(&payer.pubkey()),
+        &[&payer],
+        LAST_BLOCKHASH,
+    ));
+    let mut env = SvmTestEnvironment::create(test_entry);
+    let mut overrides = solana_svm::account_overrides::AccountOverrides::default();
+    if override_account {
+        // SlotHistory is the only supported override. Give it a valid program
+        // account in this fixture to exercise the resolver, not a new override API.
+        let mut accounts = env.mock_bank.account_shared_data.write().unwrap();
+        let mut account = accounts
+            .get(&program_address("hello-solana"))
+            .unwrap()
+            .clone();
+        accounts.insert(program, account.clone());
+        let mut bytes = account.data().to_vec();
+        bytes.push(1);
+        account.set_data(bytes);
+        overrides.set_slot_history(Some(account));
+        env.processing_config.account_overrides = Some(&overrides);
+    }
+    env.processing_config.program_load_cache = Some(&cache);
+    let runtime_env = env
+        .processing_environment
+        .program_runtime_environments
+        .get_env_for_execution();
+    let original = load_program_with_pubkey_and_cache(
+        &env.mock_bank,
+        runtime_env,
+        &program,
+        EXECUTION_SLOT,
+        &mut ExecuteTimings::default(),
+        Some(&cache),
+    )
+    .unwrap()
+    .0;
+    if unloaded {
+        original.stats.uses.store(7, Ordering::Relaxed);
+        original.stats.jit_compiled(123);
+        assert!(
+            !env.batch_processor
+                .global_program_cache
+                .write()
+                .unwrap()
+                .assign_program(
+                    runtime_env,
+                    program,
+                    0,
+                    Arc::new(original.to_unloaded().unwrap()),
+                )
+        );
+    }
+    let compilations = original.stats.compilations.load(Ordering::Relaxed);
+    let compilation_ema = original.stats.compilation_time_ema.load(Ordering::Relaxed);
+    let (transactions, checks) = env.test_entry.prepare_transactions();
+    let output = env.batch_processor.load_and_execute_sanitized_transactions(
+        &env.mock_bank,
+        &transactions,
+        checks,
+        &env.processing_environment,
+        &env.processing_config,
+    );
+    for result in &output.processing_results {
+        assert!(
+            matches!(result, Ok(ProcessedTransaction::Executed(tx)) if tx.was_successful()),
+            "{result:?}"
+        );
+    }
+    let receipts = cache.0.lock().unwrap();
+    let changed = prior_write || override_account;
+    assert_eq!(receipts.len(), if changed { 2 } else { 1 });
+    let (_, cached) = env
+        .batch_processor
+        .global_program_cache
+        .read()
+        .unwrap()
+        .get_flattened_entries_for_tests()
+        .into_iter()
+        .find(|(key, _)| *key == program)
+        .unwrap();
+    assert_eq!(Arc::ptr_eq(&cached, &original), !changed);
+    if changed {
+        assert_ne!(receipts[0].0.identity(), receipts[1].0.identity());
+    } else {
+        assert_eq!(
+            output.execute_timings.details.create_executor_load_elf_us.0,
+            0
+        );
+        assert_eq!(
+            output
+                .execute_timings
+                .details
+                .create_executor_verify_code_us
+                .0,
+            0
+        );
+        assert_eq!(
+            output
+                .execute_timings
+                .details
+                .create_executor_jit_compile_us
+                .0,
+            0
+        );
+        assert_eq!(
+            original.stats.uses.load(Ordering::Relaxed),
+            if unloaded { 8 } else { 1 }
+        );
+        assert_eq!(
+            original.stats.compilations.load(Ordering::Relaxed),
+            compilations
+        );
+        assert_eq!(
+            original.stats.compilation_time_ema.load(Ordering::Relaxed),
+            compilation_ema
+        );
+    }
+}
 
 // Local implementation of compute budget processing for tests.
 fn process_test_compute_budget_instructions<'a>(
@@ -2802,11 +2991,19 @@ fn program_cache_create_account() {
     }
 }
 
-#[test_case(false, false; "close::scan_only")]
-#[test_case(false, true; "close::invoke")]
-#[test_case(true, false; "upgrade::scan_only")]
-#[test_case(true, true; "upgrade::invoke")]
-fn program_cache_loaderv3_update_tombstone(upgrade_program: bool, invoke_changed_program: bool) {
+#[test_case(false, false, false; "close::scan_only")]
+#[test_case(false, true, false; "close::invoke")]
+#[test_case(true, false, false; "upgrade::scan_only")]
+#[test_case(true, true, false; "upgrade::invoke")]
+#[test_case(false, false, true; "receipt::close::scan_only")]
+#[test_case(false, true, true; "receipt::close::invoke")]
+#[test_case(true, false, true; "receipt::upgrade::scan_only")]
+#[test_case(true, true, true; "receipt::upgrade::invoke")]
+fn program_cache_loaderv3_update_tombstone(
+    upgrade_program: bool,
+    invoke_changed_program: bool,
+    reuse: bool,
+) {
     let mut test_entry = SvmTestEntry::default();
 
     let program_name = "hello-solana";
@@ -2889,6 +3086,23 @@ fn program_cache_loaderv3_update_tombstone(upgrade_program: bool, invoke_changed
     }
 
     let mut env = SvmTestEnvironment::create(test_entry);
+
+    let cache = ReceiptCache::default();
+    if reuse {
+        load_program_with_pubkey_and_cache(
+            &env.mock_bank,
+            env.processing_environment
+                .program_runtime_environments
+                .get_env_for_execution(),
+            &program_id,
+            EXECUTION_SLOT,
+            &mut ExecuteTimings::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(cache.0.lock().unwrap().len(), 1);
+        env.processing_config.program_load_cache = Some(&cache);
+    }
 
     // test in same entry as program change
     env.execute();
@@ -3725,6 +3939,7 @@ fn fee_only_loaded_transaction_data_size(define_ltds_fee_only_semantics: bool) {
 
 // Tests for proper accumulation of metrics across loaded programs in a batch.
 #[test]
+#[cfg(feature = "metrics")]
 fn svm_metrics_accumulation() {
     for test_entry in program_medley(false) {
         let env = SvmTestEnvironment::create(test_entry);

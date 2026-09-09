@@ -8,7 +8,10 @@ use {
         account_overrides::AccountOverrides,
         message_processor::process_message,
         nonce_info::NonceInfo,
-        program_loader::{filter_executable_program_accounts, load_program_with_pubkey},
+        program_loader::{
+            ProgramLoadCache, filter_executable_program_accounts, load_program_with_pubkey,
+            load_program_with_pubkey_and_cache,
+        },
         rollback_accounts::RollbackAccounts,
         transaction_account_state_info::{
             TransactionAccountStateInfo, get_uninitialized_accounts_size, verify_changes,
@@ -116,6 +119,8 @@ impl ExecutionRecordingConfig {
 /// Configurations for processing transactions.
 #[derive(Default)]
 pub struct TransactionProcessingConfig<'a> {
+    /// Optional reuse of native verified loads; disabled for ordinary Bank callers.
+    pub program_load_cache: Option<&'a dyn ProgramLoadCache>,
     /// Encapsulates overridden accounts, typically used for transaction
     /// simulation.
     pub account_overrides: Option<&'a AccountOverrides>,
@@ -534,6 +539,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                             &mut execute_timings,
                             config.limit_to_load_programs,
                             true, // increment_usage_counter
+                            config.program_load_cache,
                         );
                     });
                     execute_timings.saturating_add_in_place(
@@ -847,6 +853,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         execute_timings: &mut ExecuteTimings,
         limit_to_load_programs: bool,
         increment_usage_counter: bool,
+        program_load_cache: Option<&dyn ProgramLoadCache>,
     ) {
         let mut count_hits_and_misses = true;
         loop {
@@ -868,12 +875,13 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
             let program_to_store = program_to_load.map(|key| {
                 // Load, verify and compile one program.
-                let (program, last_modification_slot) = load_program_with_pubkey(
+                let (program, last_modification_slot) = load_program_with_pubkey_and_cache(
                     account_loader,
                     program_runtime_environment_for_execution,
                     &key,
                     self.slot,
                     execute_timings,
+                    program_load_cache,
                 )
                 .expect("called load_program_with_pubkey() with nonexistent account");
                 (key, program, last_modification_slot)
@@ -1817,6 +1825,7 @@ mod tests {
             &mut ExecuteTimings::default(),
             true,
             true,
+            None,
         );
     }
 
@@ -1856,6 +1865,7 @@ mod tests {
                 &mut ExecuteTimings::default(),
                 limit_to_load_programs,
                 true,
+                None,
             );
             assert!(!program_cache_for_tx_batch.hit_max_limit);
             if program_cache_for_tx_batch.loaded_missing {
