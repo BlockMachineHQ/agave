@@ -35,7 +35,7 @@ impl SlotParams {
     /// Genesis can customize timing values. Bank construction can also
     /// customize the partitioned-rewards write budget. Values without an
     /// explicit construction-time knob retain the legacy baseline.
-    pub(crate) fn genesis_baseline(
+    pub fn genesis_baseline(
         ns_per_slot: u128,
         slots_per_year: f64,
         hashes_per_tick: Option<u64>,
@@ -91,7 +91,7 @@ impl SlotParams {
     }
 
     /// Returns the per-bank cost limits for these params.
-    pub(crate) const fn cost_limits(self, raise_block_limits_to_100m: bool) -> CostTrackerLimits {
+    pub const fn cost_limits(self, raise_block_limits_to_100m: bool) -> CostTrackerLimits {
         let cost_tracker_limits = self.cost_tracker_limits;
         let (account_cost, block_cost) = if raise_block_limits_to_100m {
             (
@@ -120,7 +120,7 @@ impl SlotParams {
 }
 
 pub const LEGACY_HASHES_PER_TICK: u64 = 62_500;
-pub(crate) const LEGACY_SLOT_PARAMS: SlotParams = SlotParams {
+pub const LEGACY_SLOT_PARAMS: SlotParams = SlotParams {
     ns_per_slot: 400_000_000,
     slots_per_year: 78_892_314.984,
     hashes_per_tick: Some(LEGACY_HASHES_PER_TICK),
@@ -217,7 +217,7 @@ pub fn slot_time_feature_ids() -> [Pubkey; 4] {
 /// avoids repeatedly scanning, collecting, and sorting slot-time gates once they
 /// are added.
 #[derive(Clone, Debug)]
-pub(crate) struct SlotParamsArchive {
+pub struct SlotParamsArchive {
     /// Sorted `(effective_slot, params)` transitions, including baseline at slot 0.
     ///
     /// This is used when a bank, usually the root bank, must answer "which
@@ -240,7 +240,7 @@ impl Default for SlotParamsArchive {
 
 impl SlotParamsArchive {
     /// Rebuilds slot-parameter transitions from the active feature set.
-    pub(crate) fn new(
+    pub fn new(
         feature_set: &FeatureSet,
         epoch_schedule: &EpochSchedule,
         baseline_params: SlotParams,
@@ -269,7 +269,7 @@ impl SlotParamsArchive {
     }
 
     /// Returns the baseline params supplied at genesis or snapshot restore.
-    pub(crate) fn baseline_params(&self) -> SlotParams {
+    pub fn baseline_params(&self) -> SlotParams {
         self.param_transitions
             .first_key_value()
             .map(|(_, params)| *params)
@@ -277,7 +277,7 @@ impl SlotParamsArchive {
     }
 
     /// Returns the slot params effective at `slot`.
-    pub(crate) fn params_at_slot(&self, slot: Slot) -> SlotParams {
+    pub fn params_at_slot(&self, slot: Slot) -> SlotParams {
         self.param_transitions
             .range(..=slot)
             .next_back()
@@ -286,7 +286,7 @@ impl SlotParamsArchive {
     }
 
     /// Returns sorted slot-parameter transitions.
-    pub(crate) fn param_transitions(&self) -> impl Iterator<Item = (Slot, SlotParams)> + '_ {
+    pub fn param_transitions(&self) -> impl Iterator<Item = (Slot, SlotParams)> + '_ {
         self.param_transitions
             .iter()
             .map(|(slot, params)| (*slot, *params))
@@ -294,7 +294,7 @@ impl SlotParamsArchive {
 
     /// Returns the exact wall-clock duration in nanoseconds for
     /// `start_slot..=end_slot`.
-    pub(crate) fn slot_range_duration_nanos(&self, start_slot: Slot, end_slot: Slot) -> u128 {
+    pub fn slot_range_duration_nanos(&self, start_slot: Slot, end_slot: Slot) -> u128 {
         if start_slot > end_slot {
             return 0;
         }
@@ -324,7 +324,7 @@ impl SlotParamsArchive {
     /// A gate that activates in epoch E is effective starting at the first slot
     /// of epoch E + 1, giving shred filters a full epoch of advance notice
     /// before enforcing lower shred limits.
-    fn feature_effective_slot(epoch_schedule: &EpochSchedule, activation_slot: Slot) -> Slot {
+    pub fn feature_effective_slot(epoch_schedule: &EpochSchedule, activation_slot: Slot) -> Slot {
         let activation_epoch = epoch_schedule.get_epoch(activation_slot);
         epoch_schedule.get_first_slot_in_epoch(activation_epoch.saturating_add(1))
     }
@@ -333,7 +333,7 @@ impl SlotParamsArchive {
     ///
     /// Feature activation happens in one epoch, but slot params become effective
     /// at the start of the following epoch.
-    pub(crate) fn any_slot_time_reduction_effective(
+    pub fn any_slot_time_reduction_effective(
         epoch_schedule: &EpochSchedule,
         slot: Slot,
         feature_set: &FeatureSet,

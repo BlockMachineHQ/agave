@@ -14,16 +14,16 @@ use {
 const _MAX_ALLOWABLE_DRIFT_PERCENTAGE: u32 = 50;
 const _MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW: u32 = 80;
 
-pub(crate) const MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST: u32 = 25;
-pub(crate) const MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2: u32 = 150;
+pub const MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST: u32 = 25;
+pub const MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2: u32 = 150;
 
 #[derive(Copy, Clone)]
-pub(crate) struct MaxAllowableDrift {
+pub struct MaxAllowableDrift {
     pub fast: u32, // Max allowable drift percentage faster than poh estimate
     pub slow: u32, // Max allowable drift percentage slower than poh estimate
 }
 
-pub(crate) fn calculate_stake_weighted_timestamp<I, K, V, T>(
+pub fn calculate_stake_weighted_timestamp<I, K, V, T>(
     unique_timestamps: I,
     stakes: &HashMap<Pubkey, (u64, T /*Account|VoteAccount*/)>,
     slot: Slot,
