@@ -711,19 +711,10 @@ enum UsageQueueInner {
 type UsageFromTask = (RequestedUsage, Task);
 
 impl UsageQueueInner {
-    fn with_fifo() -> Self {
+    fn with_fifo(initial_capacity: usize) -> Self {
         Self::Fifo {
             current_usage: None,
-            // Capacity should be configurable to create with large capacity like 1024 inside the
-            // (multi-threaded) closures passed to create_task(). In this way, reallocs can be
-            // avoided happening in the scheduler thread. Also, this configurability is desired for
-            // unified-scheduler-logic's motto: separation of concerns (the pure logic should be
-            // sufficiently distanced from any some random knob's constants needed for messy
-            // reality for author's personal preference...).
-            //
-            // Note that large cap should be accompanied with proper scheduler cleaning after use,
-            // which should be handled by higher layers (i.e. scheduler pool).
-            blocked_usages_from_tasks: VecDeque::with_capacity(128),
+            blocked_usages_from_tasks: VecDeque::with_capacity(initial_capacity),
         }
     }
 
@@ -736,13 +727,6 @@ impl UsageQueueInner {
             // those lookups by the current implementation, we can't use BinaryHeap and its family
             // _for now_.
             blocked_usages_from_tasks: PriorityUsageQueue::new(),
-        }
-    }
-
-    fn new(capability: &Capability) -> Self {
-        match capability {
-            Capability::FifoQueueing => Self::with_fifo(),
-            Capability::PriorityQueueing => Self::with_priority(),
         }
     }
 }
@@ -1018,8 +1002,7 @@ impl UsageQueueInner {
 const_assert_eq!(mem::size_of::<TokenCell<UsageQueueInner>>(), 56);
 
 /// Scheduler's internal data for each address ([`Pubkey`](`solana_pubkey::Pubkey`)). Very
-/// opaque wrapper type; no methods just with [`::clone()`](Clone::clone) and
-/// [`::default()`](Default::default).
+/// opaque wrapper type with constructors and [`::clone()`](Clone::clone).
 ///
 /// It's the higher layer's responsibility to ensure to associate the same instance of UsageQueue
 /// for given Pubkey at the time of [task](Task) creation.
@@ -1029,7 +1012,24 @@ const_assert_eq!(mem::size_of::<UsageQueue>(), 8);
 
 impl UsageQueue {
     pub fn new(capability: &Capability) -> Self {
-        Self(Arc::new(TokenCell::new(UsageQueueInner::new(capability))))
+        match capability {
+            Capability::FifoQueueing => Self::new_fifo(128),
+            Capability::PriorityQueueing => {
+                Self(Arc::new(TokenCell::new(UsageQueueInner::with_priority())))
+            }
+        }
+    }
+
+    /// Creates a FIFO queue with space for at least `initial_capacity` blocked usages.
+    ///
+    /// Zero avoids allocating the blocked-usage buffer until needed. This is an initial
+    /// reservation, not a limit: the buffer grows as needed and retains capacity after use.
+    /// Allocation and capacity-overflow behavior are those of [`VecDeque::with_capacity`].
+    /// Callers remain responsible for caching and pruning queues.
+    pub fn new_fifo(initial_capacity: usize) -> Self {
+        Self(Arc::new(TokenCell::new(UsageQueueInner::with_fifo(
+            initial_capacity,
+        ))))
     }
 }
 
@@ -1526,6 +1526,47 @@ mod tests {
         let message = Message::new(&[], Some(&Pubkey::new_unique()));
         let unsigned = Transaction::new_unsigned(message);
         RuntimeTransaction::from_transaction_for_tests(unsigned)
+    }
+
+    #[test]
+    fn test_usage_queue_initial_capacity() {
+        std::thread::spawn(|| {
+            // SAFETY: This is the only scheduler initialized on this isolated thread,
+            // and its queues are never accessed by another scheduler.
+            let mut scheduler = unsafe {
+                SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling(
+                    None, None,
+                )
+            };
+            for (queue, expected) in [
+                (UsageQueue::new(&Capability::FifoQueueing), 128),
+                (UsageQueue::new_fifo(0), 0),
+                (UsageQueue::new_fifo(1), 1),
+                (UsageQueue::new_fifo(128), 128),
+            ] {
+                queue
+                    .0
+                    .with_borrow_mut(&mut scheduler.usage_queue_token, |inner| {
+                        let UsageQueueInner::Fifo {
+                            current_usage,
+                            blocked_usages_from_tasks,
+                        } = inner
+                        else {
+                            panic!("expected FIFO queue");
+                        };
+                        assert!(current_usage.is_none());
+                        assert!(blocked_usages_from_tasks.is_empty());
+                        assert_eq!(blocked_usages_from_tasks.capacity(), expected);
+                    });
+            }
+            UsageQueue::new(&Capability::PriorityQueueing)
+                .0
+                .with_borrow_mut(&mut scheduler.usage_queue_token, |inner| {
+                    assert_matches!(inner, UsageQueueInner::Priority { .. });
+                });
+        })
+        .join()
+        .unwrap();
     }
 
     fn transaction_with_readonly_address(
