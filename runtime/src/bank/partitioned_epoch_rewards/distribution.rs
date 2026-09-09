@@ -52,7 +52,7 @@ struct DistributionResults {
 /// lamports are not double-counted for the rent-exempt minimum and the stake
 /// delegation. This function adjusts the delegation in a Stake if needed, right
 /// at distribution time.
-fn adjust_delegation_for_rent(
+pub fn adjust_delegation_for_rent(
     delegation: &mut Delegation,
     rewarded_epoch: Epoch,
     new_delegation_with_rewards: u64,

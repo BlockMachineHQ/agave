@@ -3,6 +3,8 @@ mod distribution;
 mod epoch_rewards_hasher;
 mod sysvar;
 
+pub use distribution::adjust_delegation_for_rent;
+
 use {
     super::Bank,
     crate::{

@@ -9,7 +9,7 @@ use {
 };
 
 #[inline]
-pub(crate) fn delegation_effective_stake<T: StakeHistoryGetEntry>(
+pub fn delegation_effective_stake<T: StakeHistoryGetEntry>(
     delegation: &Delegation,
     epoch: Epoch,
     history: &T,
@@ -25,7 +25,7 @@ pub(crate) fn delegation_effective_stake<T: StakeHistoryGetEntry>(
 }
 
 #[inline]
-pub(crate) fn delegation_activation_status<T: StakeHistoryGetEntry>(
+pub fn delegation_activation_status<T: StakeHistoryGetEntry>(
     delegation: &Delegation,
     epoch: Epoch,
     history: &T,

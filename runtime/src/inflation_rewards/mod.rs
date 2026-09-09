@@ -19,6 +19,33 @@ use {
 
 pub mod points;
 
+pub use crate::bank::partitioned_epoch_rewards::adjust_delegation_for_rent;
+
+/// Redeems Tower rewards through the native calculation, returning
+/// `(staker_rewards, voter_rewards, updated_stake)` or `NoCreditsToRedeem`.
+/// The caller must select this only for Tower rewards, not Alpenglow or migration rewards.
+/// Commission is supplied in basis points after the caller's historical-rate selection.
+pub fn redeem_rewards_for_tower(
+    stake: Stake,
+    voter_commission_bps: u16,
+    vote_state: DelegatedVoteState,
+    calculation_environment: CalculationEnvironment<'_>,
+    inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    current_lamports: u64,
+    minimum_lamports: u64,
+) -> Result<(u64, u64, Stake), InstructionError> {
+    redeem_rewards(
+        stake,
+        voter_commission_bps,
+        vote_state,
+        calculation_environment,
+        inflation_point_calc_tracer,
+        &AlpenglowEpochType::Tower,
+        current_lamports,
+        minimum_lamports,
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CalculatedStakeRewards {
     staker_rewards: u64,
@@ -174,7 +201,7 @@ fn redeem_stake_rewards<'a>(
 /// The actual adjustment happens at distribution, to account for any lamports
 /// credited to the account during partitioned epoch rewards, before the
 /// distribution has occurred.
-pub(crate) fn delegation_may_need_adjustment(
+pub fn delegation_may_need_adjustment(
     current_delegation: u64,
     new_delegation_with_rewards: u64,
     lamports_with_rewards: u64,
