@@ -1,6 +1,5 @@
 use {
-    super::error::CoreBpfMigrationError,
-    crate::bank::Bank,
+    super::{AccountReader, error::CoreBpfMigrationError},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_builtins::core_bpf_migration::CoreBpfMigrationTargetType,
     solana_loader_v3_interface::get_program_data_address,
@@ -12,7 +11,7 @@ use {
 
 /// The account details of a built-in program to be migrated to Core BPF.
 #[derive(Debug)]
-pub(crate) struct TargetBuiltin {
+pub struct TargetBuiltin {
     pub program_address: Pubkey,
     pub program_account: AccountSharedData,
     pub program_data_address: Pubkey,
@@ -22,8 +21,8 @@ pub(crate) struct TargetBuiltin {
 impl TargetBuiltin {
     /// Collects the details of a built-in program and verifies it is properly
     /// configured
-    pub(crate) fn new_checked(
-        bank: &Bank,
+    pub fn new_checked(
+        reader: &dyn AccountReader,
         program_address: &Pubkey,
         migration_target: &CoreBpfMigrationTargetType,
         allow_prefunded: bool,
@@ -31,8 +30,8 @@ impl TargetBuiltin {
         let program_account = match migration_target {
             CoreBpfMigrationTargetType::Builtin => {
                 // The program account should exist.
-                let program_account = bank
-                    .get_account_with_fixed_root(program_address)
+                let program_account = reader
+                    .read(program_address)
                     .ok_or(CoreBpfMigrationError::AccountNotFound(*program_address))?;
 
                 // The program account should be owned by the native loader.
@@ -44,7 +43,7 @@ impl TargetBuiltin {
             }
             CoreBpfMigrationTargetType::Stateless => {
                 // The program account should _not_ exist.
-                if bank.get_account_with_fixed_root(program_address).is_some() {
+                if reader.read(program_address).is_some() {
                     return Err(CoreBpfMigrationError::AccountExists(*program_address));
                 }
 
@@ -57,7 +56,7 @@ impl TargetBuiltin {
         let program_data_account_lamports = if allow_prefunded {
             // The program data account should not exist, but a system account with funded
             // lamports is acceptable.
-            if let Some(account) = bank.get_account_with_fixed_root(&program_data_address) {
+            if let Some(account) = reader.read(&program_data_address) {
                 if account.owner() != &SYSTEM_PROGRAM_ID {
                     return Err(CoreBpfMigrationError::ProgramHasDataAccount(
                         *program_address,
@@ -69,10 +68,7 @@ impl TargetBuiltin {
             }
         } else {
             // The program data account should not exist and have zero lamports.
-            if bank
-                .get_account_with_fixed_root(&program_data_address)
-                .is_some()
-            {
+            if reader.read(&program_data_address).is_some() {
                 return Err(CoreBpfMigrationError::ProgramHasDataAccount(
                     *program_address,
                 ));
@@ -93,8 +89,11 @@ impl TargetBuiltin {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, crate::bank::tests::create_simple_test_bank, agave_feature_set as feature_set,
-        assert_matches::assert_matches, solana_account::Account,
+        super::*,
+        crate::bank::{Bank, tests::create_simple_test_bank},
+        agave_feature_set as feature_set,
+        assert_matches::assert_matches,
+        solana_account::Account,
         solana_feature_gate_interface as feature,
         solana_loader_v3_interface::state::UpgradeableLoaderState,
         solana_sdk_ids::bpf_loader_upgradeable::ID as BPF_LOADER_UPGRADEABLE_ID,

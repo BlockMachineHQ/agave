@@ -4,9 +4,13 @@ mod target_bpf_v2;
 mod target_builtin;
 mod target_core_bpf;
 
+pub use {
+    error::CoreBpfMigrationError, source_buffer::SourceBuffer, target_bpf_v2::TargetBpfV2,
+    target_builtin::TargetBuiltin, target_core_bpf::TargetCoreBpf,
+};
+
 use {
-    crate::bank::{Bank, builtins::core_bpf_migration::target_bpf_v2::TargetBpfV2},
-    error::CoreBpfMigrationError,
+    crate::bank::Bank,
     num_traits::{CheckedAdd, CheckedSub},
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_builtins::core_bpf_migration::CoreBpfMigrationConfig,
@@ -27,13 +31,32 @@ use {
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_svm_callback::InvokeContextCallback,
     solana_transaction_context::transaction::TransactionContext,
-    source_buffer::SourceBuffer,
     std::{cmp::Ordering, sync::atomic::Ordering::Relaxed},
-    target_builtin::TargetBuiltin,
-    target_core_bpf::TargetCoreBpf,
 };
 
-fn checked_add<T: CheckedAdd>(a: T, b: T) -> Result<T, CoreBpfMigrationError> {
+/// Account lookup for checked Core BPF migration inputs.
+///
+/// `None` must mean an absent account, never a backing-store failure. Readers
+/// with fallible storage must treat I/O errors as fatal, not migration errors.
+/// Bank uses its fixed-root lookup; other readers must supply the intended view.
+pub trait AccountReader {
+    fn read(&self, pubkey: &Pubkey) -> Option<AccountSharedData>;
+}
+
+impl AccountReader for Bank {
+    fn read(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        self.get_account_with_fixed_root(pubkey)
+    }
+}
+
+impl<F: Fn(&Pubkey) -> Option<AccountSharedData>> AccountReader for F {
+    fn read(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        self(pubkey)
+    }
+}
+
+/// Add migration balances or data sizes without overflowing.
+pub fn checked_add<T: CheckedAdd>(a: T, b: T) -> Result<T, CoreBpfMigrationError> {
     a.checked_add(&b)
         .ok_or(CoreBpfMigrationError::ArithmeticOverflow)
 }
@@ -43,81 +66,102 @@ fn checked_sub<T: CheckedSub>(a: T, b: T) -> Result<T, CoreBpfMigrationError> {
         .ok_or(CoreBpfMigrationError::ArithmeticOverflow)
 }
 
+/// Create an `AccountSharedData` with data initialized to
+/// `UpgradeableLoaderState::Program` populated with the target's new data
+/// account address.
+/// The callback supplies the caller's rent-exempt minimum balance.
+pub fn new_target_program_account(
+    minimum_balance: impl FnOnce(usize) -> u64,
+    program_data_address: &Pubkey,
+) -> Result<AccountSharedData, CoreBpfMigrationError> {
+    let state = UpgradeableLoaderState::Program {
+        programdata_address: *program_data_address,
+    };
+    let lamports = minimum_balance(UpgradeableLoaderState::size_of_program());
+    let mut account = AccountSharedData::new_data(lamports, &state, &bpf_loader_upgradeable::id())?;
+    account.set_executable(true);
+    Ok(account)
+}
+
+/// Create an `AccountSharedData` with data initialized to
+/// `UpgradeableLoaderState::ProgramData` populated with the current slot, as
+/// well as the source program data account's upgrade authority and ELF.
+///
+/// This function accepts a provided upgrade authority address, which comes
+/// from the migration configuration. If the provided upgrade authority
+/// address is different from the source buffer account's upgrade authority
+/// address, the migration will fail. If the provided upgrade authority
+/// address is `None`, the migration will ignore the source buffer account's
+/// upgrade authority and set the new program data account's upgrade
+/// authority to `None`.
+/// `source` must retain the buffer validated by `SourceBuffer::new_checked`.
+/// The rent callback is invoked only after validating the authority.
+pub fn new_target_program_data_account(
+    minimum_balance: impl FnOnce(usize) -> u64,
+    slot: solana_clock::Slot,
+    source: &SourceBuffer,
+    upgrade_authority_address: Option<Pubkey>,
+) -> Result<AccountSharedData, CoreBpfMigrationError> {
+    let buffer_metadata_size = UpgradeableLoaderState::size_of_buffer_metadata();
+    if let UpgradeableLoaderState::Buffer {
+        authority_address: buffer_authority,
+    } = bincode::deserialize(&source.buffer_account.data()[..buffer_metadata_size])?
+    {
+        if let Some(provided_authority) = upgrade_authority_address
+            && upgrade_authority_address != buffer_authority
+        {
+            return Err(CoreBpfMigrationError::UpgradeAuthorityMismatch(
+                provided_authority,
+                buffer_authority,
+            ));
+        }
+
+        let elf = &source.buffer_account.data()[buffer_metadata_size..];
+
+        let programdata_metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+        let space = programdata_metadata_size + elf.len();
+        let lamports = minimum_balance(space);
+        let owner = &bpf_loader_upgradeable::id();
+
+        let programdata_metadata = UpgradeableLoaderState::ProgramData {
+            slot,
+            upgrade_authority_address,
+        };
+
+        let mut account =
+            AccountSharedData::new_data_with_space(lamports, &programdata_metadata, space, owner)?;
+        account.data_as_mut_slice()[programdata_metadata_size..].copy_from_slice(elf);
+
+        Ok(account)
+    } else {
+        Err(CoreBpfMigrationError::InvalidBufferAccount(
+            source.buffer_address,
+        ))
+    }
+}
+
 impl Bank {
-    /// Create an `AccountSharedData` with data initialized to
-    /// `UpgradeableLoaderState::Program` populated with the target's new data
-    /// account address.
     fn new_target_program_account(
         &self,
         program_data_address: &Pubkey,
     ) -> Result<AccountSharedData, CoreBpfMigrationError> {
-        let state = UpgradeableLoaderState::Program {
-            programdata_address: *program_data_address,
-        };
-        let lamports =
-            self.get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program());
-        let mut account =
-            AccountSharedData::new_data(lamports, &state, &bpf_loader_upgradeable::id())?;
-        account.set_executable(true);
-        Ok(account)
+        new_target_program_account(
+            |space| self.get_minimum_balance_for_rent_exemption(space),
+            program_data_address,
+        )
     }
 
-    /// Create an `AccountSharedData` with data initialized to
-    /// `UpgradeableLoaderState::ProgramData` populated with the current slot, as
-    /// well as the source program data account's upgrade authority and ELF.
-    ///
-    /// This function accepts a provided upgrade authority address, which comes
-    /// from the migration configuration. If the provided upgrade authority
-    /// address is different from the source buffer account's upgrade authority
-    /// address, the migration will fail. If the provided upgrade authority
-    /// address is `None`, the migration will ignore the source buffer account's
-    /// upgrade authority and set the new program data account's upgrade
-    /// authority to `None`.
     fn new_target_program_data_account(
         &self,
         source: &SourceBuffer,
         upgrade_authority_address: Option<Pubkey>,
     ) -> Result<AccountSharedData, CoreBpfMigrationError> {
-        let buffer_metadata_size = UpgradeableLoaderState::size_of_buffer_metadata();
-        if let UpgradeableLoaderState::Buffer {
-            authority_address: buffer_authority,
-        } = bincode::deserialize(&source.buffer_account.data()[..buffer_metadata_size])?
-        {
-            if let Some(provided_authority) = upgrade_authority_address
-                && upgrade_authority_address != buffer_authority
-            {
-                return Err(CoreBpfMigrationError::UpgradeAuthorityMismatch(
-                    provided_authority,
-                    buffer_authority,
-                ));
-            }
-
-            let elf = &source.buffer_account.data()[buffer_metadata_size..];
-
-            let programdata_metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
-            let space = programdata_metadata_size + elf.len();
-            let lamports = self.get_minimum_balance_for_rent_exemption(space);
-            let owner = &bpf_loader_upgradeable::id();
-
-            let programdata_metadata = UpgradeableLoaderState::ProgramData {
-                slot: self.slot,
-                upgrade_authority_address,
-            };
-
-            let mut account = AccountSharedData::new_data_with_space(
-                lamports,
-                &programdata_metadata,
-                space,
-                owner,
-            )?;
-            account.data_as_mut_slice()[programdata_metadata_size..].copy_from_slice(elf);
-
-            Ok(account)
-        } else {
-            Err(CoreBpfMigrationError::InvalidBufferAccount(
-                source.buffer_address,
-            ))
-        }
+        new_target_program_data_account(
+            |space| self.get_minimum_balance_for_rent_exemption(space),
+            self.slot,
+            source,
+            upgrade_authority_address,
+        )
     }
 
     /// In order to properly update a newly migrated or upgraded Core BPF

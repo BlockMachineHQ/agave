@@ -16,6 +16,14 @@ pub mod bank_utils;
 pub mod block_component_processor;
 pub mod commitment;
 pub mod consensus;
+/// Checked Core BPF migration inputs and account synthesis, without deployment
+/// or Bank mutation. Native migrations use these same implementations.
+pub mod core_bpf_migration {
+    pub use crate::bank::builtins::core_bpf_migration::{
+        AccountReader, CoreBpfMigrationError, SourceBuffer, TargetBpfV2, TargetBuiltin,
+        TargetCoreBpf, checked_add, new_target_program_account, new_target_program_data_account,
+    };
+}
 pub mod dependency_tracker;
 pub mod epoch_stakes;
 pub mod genesis_utils;

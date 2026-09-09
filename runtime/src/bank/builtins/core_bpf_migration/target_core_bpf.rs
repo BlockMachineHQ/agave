@@ -1,6 +1,5 @@
 use {
-    super::error::CoreBpfMigrationError,
-    crate::bank::Bank,
+    super::{AccountReader, error::CoreBpfMigrationError},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState},
     solana_pubkey::Pubkey,
@@ -9,7 +8,7 @@ use {
 
 /// The account details of a Core BPF program slated to be upgraded.
 #[derive(Debug)]
-pub(crate) struct TargetCoreBpf {
+pub struct TargetCoreBpf {
     pub program_address: Pubkey,
     pub program_data_address: Pubkey,
     pub program_data_account: AccountSharedData,
@@ -23,15 +22,15 @@ impl TargetCoreBpf {
     /// and it should be marked as executable.
     /// The program data account should exist with the correct state
     /// (a ProgramData header and the program ELF).
-    pub(crate) fn new_checked(
-        bank: &Bank,
+    pub fn new_checked(
+        reader: &dyn AccountReader,
         program_address: &Pubkey,
     ) -> Result<Self, CoreBpfMigrationError> {
         let program_data_address = get_program_data_address(program_address);
 
         // The program account should exist.
-        let program_account = bank
-            .get_account_with_fixed_root(program_address)
+        let program_account = reader
+            .read(program_address)
             .ok_or(CoreBpfMigrationError::AccountNotFound(*program_address))?;
 
         // The program account should be owned by the upgradeable loader.
@@ -59,11 +58,9 @@ impl TargetCoreBpf {
         }
 
         // The program data account should exist.
-        let program_data_account = bank
-            .get_account_with_fixed_root(&program_data_address)
-            .ok_or(CoreBpfMigrationError::ProgramHasNoDataAccount(
-                *program_address,
-            ))?;
+        let program_data_account = reader.read(&program_data_address).ok_or(
+            CoreBpfMigrationError::ProgramHasNoDataAccount(*program_address),
+        )?;
 
         // The program data account should be owned by the upgradeable loader.
         if program_data_account.owner() != &bpf_loader_upgradeable::id() {
@@ -94,8 +91,11 @@ impl TargetCoreBpf {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, crate::bank::tests::create_simple_test_bank, assert_matches::assert_matches,
-        solana_account::WritableAccount, solana_sdk_ids::bpf_loader_upgradeable,
+        super::*,
+        crate::bank::{Bank, tests::create_simple_test_bank},
+        assert_matches::assert_matches,
+        solana_account::WritableAccount,
+        solana_sdk_ids::bpf_loader_upgradeable,
     };
 
     fn store_account(bank: &Bank, address: &Pubkey, data: &[u8], owner: &Pubkey, executable: bool) {

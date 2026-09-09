@@ -1,6 +1,5 @@
 use {
-    super::error::CoreBpfMigrationError,
-    crate::bank::Bank,
+    super::{AccountReader, error::CoreBpfMigrationError},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_hash::Hash,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
@@ -11,7 +10,7 @@ use {
 /// The account details of a buffer account slated to replace a built-in
 /// program.
 #[derive(Debug)]
-pub(crate) struct SourceBuffer {
+pub struct SourceBuffer {
     pub buffer_address: Pubkey,
     pub buffer_account: AccountSharedData,
 }
@@ -19,13 +18,13 @@ pub(crate) struct SourceBuffer {
 impl SourceBuffer {
     /// Collects the details of a buffer account and verifies it exists, is
     /// owned by the upgradeable loader, and has the correct state.
-    pub(crate) fn new_checked(
-        bank: &Bank,
+    pub fn new_checked(
+        reader: &dyn AccountReader,
         buffer_address: &Pubkey,
     ) -> Result<Self, CoreBpfMigrationError> {
         // The buffer account should exist.
-        let buffer_account = bank
-            .get_account_with_fixed_root(buffer_address)
+        let buffer_account = reader
+            .read(buffer_address)
             .ok_or(CoreBpfMigrationError::AccountNotFound(*buffer_address))?;
 
         // The buffer account should be owned by the upgradeable loader.
@@ -49,12 +48,12 @@ impl SourceBuffer {
 
     /// [`SourceBuffer::new_checked`] but also verifies the build hash
     /// https://github.com/Ellipsis-Labs/solana-verifiable-build
-    pub(crate) fn new_checked_with_verified_build_hash(
-        bank: &Bank,
+    pub fn new_checked_with_verified_build_hash(
+        reader: &dyn AccountReader,
         buffer_address: &Pubkey,
         expected_hash: Hash,
     ) -> Result<Self, CoreBpfMigrationError> {
-        let buffer = Self::new_checked(bank, buffer_address)?;
+        let buffer = Self::new_checked(reader, buffer_address)?;
         let data = buffer.buffer_account.data();
 
         let offset = UpgradeableLoaderState::size_of_buffer_metadata();
@@ -76,8 +75,11 @@ impl SourceBuffer {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, crate::bank::tests::create_simple_test_bank, assert_matches::assert_matches,
-        solana_account::WritableAccount, solana_sdk_ids::bpf_loader_upgradeable,
+        super::*,
+        crate::bank::{Bank, tests::create_simple_test_bank},
+        assert_matches::assert_matches,
+        solana_account::WritableAccount,
+        solana_sdk_ids::bpf_loader_upgradeable,
     };
 
     fn store_account(bank: &Bank, address: &Pubkey, data: &[u8], owner: &Pubkey) {
