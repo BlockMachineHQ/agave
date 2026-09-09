@@ -21,6 +21,7 @@ name = "solana_runtime"
 [features]
 agave-unstable-api = []
 dev-context-only-utils = [
+    "dep:trees",
     "agave-votor-messages/dev-context-only-utils",
     "solana-accounts-db/dev-context-only-utils",
     "solana-program-binaries",
@@ -183,6 +184,7 @@ strum = { workspace = true, features = ["derive"] }
 strum_macros = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+trees = { workspace = true, optional = true }
 wincode = { workspace = true }
 
 [dev-dependencies]
@@ -209,6 +211,7 @@ solana-transaction-context = { path = "../transaction-context", features = ["aga
 solana-vote-program = { path = "../programs/vote", default-features = false, features = ["agave-unstable-api", "dev-context-only-utils"] }
 static_assertions = { workspace = true }
 test-case = { workspace = true }
+trees = { workspace = true }
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dev-dependencies]
 jemallocator = { workspace = true }

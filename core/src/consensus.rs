@@ -1816,8 +1816,7 @@ pub mod test {
         super::*,
         crate::{
             consensus::{
-                fork_choice::ForkChoice, heaviest_subtree_fork_choice::SlotHashKey,
-                tower_storage::FileTowerStorage,
+                heaviest_subtree_fork_choice::SlotHashKey, tower_storage::FileTowerStorage,
             },
             replay_stage::HeaviestForkFailures,
             vote_simulator::VoteSimulator,

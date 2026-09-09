@@ -2,9 +2,7 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        consensus::{
-            fork_choice::ForkChoice, heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
-        },
+        consensus::heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
         repair::ancestor_hashes_service::{
             AncestorHashesReplayUpdate, AncestorHashesReplayUpdateSender,
         },
