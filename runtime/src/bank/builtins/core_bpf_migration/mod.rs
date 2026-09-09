@@ -628,6 +628,254 @@ pub(crate) mod tests {
         elf
     }
 
+    // Independent whole-Bank reference for bm lib/replay/src/migration_env.rs.
+    // No selector-only or dummy-invocation parity claim: the migration below is
+    // dispatched by Bank::new_from_parent -> process_new_epoch feature activation.
+    #[test]
+    fn migration_env_bank_boundary() {
+        use solana_genesis_config::GenesisConfig;
+        let elf = test_elf();
+        let rent = solana_rent::Rent::default();
+        let v3 = agave_feature_set::enable_sbpf_v3_deployment_and_execution::id();
+        let disable = agave_feature_set::disable_sbpf_v0_execution::id();
+        let reenable = agave_feature_set::reenable_sbpf_v0_execution::id();
+        let program = agave_feature_set::replace_spl_token_with_p_token::SPL_TOKEN_PROGRAM_ID;
+        let buffer = agave_feature_set::replace_spl_token_with_p_token::PTOKEN_PROGRAM_BUFFER;
+        let programdata = get_program_data_address(&program);
+        for parent_disabled in [false, true] {
+            for (prediction_epoch, prediction_disabled) in [
+                (1, None),
+                (0, Some(false)),
+                (2, Some(false)),
+                (1, Some(true)),
+                (1, Some(false)),
+            ] {
+                let mut genesis = GenesisConfig {
+                    epoch_schedule: EpochSchedule::custom(32, 32, false),
+                    rent: rent.clone(),
+                    ..GenesisConfig::default()
+                };
+                for id in if parent_disabled {
+                    vec![v3, disable]
+                } else {
+                    vec![v3]
+                } {
+                    genesis.accounts.insert(
+                        id,
+                        solana_account::Account {
+                            lamports: 1,
+                            data: bincode::serialize(&Feature {
+                                activated_at: Some(0),
+                            })
+                            .unwrap(),
+                            owner: feature::id(),
+                            executable: false,
+                            rent_epoch: 0,
+                        },
+                    );
+                }
+                let (root, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis);
+                let parent = Bank::new_from_parent(root, SlotLeader::new_unique(), 2);
+                let parent = bank_forks
+                    .write()
+                    .unwrap()
+                    .insert(parent)
+                    .clone_without_scheduler();
+                let payer = Keypair::new_from_array([17; 32]);
+                let sink = Pubkey::new_from_array([18; 32]);
+                parent.store_account_and_update_capitalization(
+                    &payer.pubkey(),
+                    &AccountSharedData::new(500_000_000, 0, &system_program::id()),
+                );
+                let mut old_program = AccountSharedData::new(
+                    rent.minimum_balance(elf.len()).max(1),
+                    elf.len(),
+                    &bpf_loader::id(),
+                );
+                old_program.set_executable(true);
+                old_program.data_as_mut_slice().copy_from_slice(&elf);
+                let space = UpgradeableLoaderState::size_of_buffer_metadata() + elf.len();
+                let mut source = AccountSharedData::new_data_with_space(
+                    rent.minimum_balance(space).max(1),
+                    &UpgradeableLoaderState::Buffer {
+                        authority_address: None,
+                    },
+                    space,
+                    &bpf_loader_upgradeable::id(),
+                )
+                .unwrap();
+                source.data_as_mut_slice()[UpgradeableLoaderState::size_of_buffer_metadata()..]
+                    .copy_from_slice(&elf);
+                let pending = AccountSharedData::new(1_000_000, Feature::size_of(), &feature::id());
+                for (key, account) in [
+                    (program, old_program.clone()),
+                    (buffer, source.clone()),
+                    (
+                        agave_feature_set::replace_spl_token_with_p_token::id(),
+                        pending.clone(),
+                    ),
+                    (if parent_disabled { reenable } else { disable }, pending),
+                ] {
+                    parent.store_account_and_update_capitalization(&key, &account);
+                }
+                let inherited = parent
+                    .transaction_processor
+                    .program_runtime_environment
+                    .clone();
+                let predicted = prediction_disabled.map(|disabled| {
+                    let mut features = FeatureSet::default();
+                    features.activate(&v3, 0);
+                    if disabled {
+                        features.activate(&disable, 0);
+                    }
+                    features.activate(&agave_feature_set::enable_get_epoch_stake_syscall::id(), 0);
+                    parent.create_program_runtime_environment(&features)
+                });
+                {
+                    let mut preparation = parent
+                        .transaction_processor
+                        .epoch_boundary_preparation
+                        .write()
+                        .unwrap();
+                    preparation.upcoming_epoch = prediction_epoch;
+                    preparation.upcoming_environment = predicted.clone();
+                }
+                let selected = if prediction_epoch == 1 {
+                    predicted.as_ref().unwrap_or(&inherited)
+                } else {
+                    &inherited
+                };
+                let succeeds = if prediction_epoch == 1 {
+                    !prediction_disabled.unwrap_or(parent_disabled)
+                } else {
+                    !parent_disabled
+                };
+                let child = Bank::new_from_parent(parent.clone(), SlotLeader::new_unique(), 32);
+                assert_eq!(child.epoch(), 1);
+                let writes = child.get_all_accounts_modified_since_parent();
+                let delta = |key: &Pubkey, account: &AccountSharedData| {
+                    i128::from(account.lamports()) - i128::from(parent.get_balance(key))
+                };
+                let account_delta: i128 = writes
+                    .iter()
+                    .map(|(key, account)| delta(key, account))
+                    .sum();
+                assert_eq!(
+                    i128::from(child.capitalization()) - i128::from(parent.capitalization()),
+                    account_delta
+                );
+                let migration_delta: i128 = writes
+                    .iter()
+                    .filter(|(key, _)| [program, programdata, buffer].contains(key))
+                    .map(|(key, account)| delta(key, account))
+                    .sum();
+                let expected_delta = if succeeds {
+                    i128::from(
+                        rent.minimum_balance(UpgradeableLoaderState::size_of_program())
+                            .max(1),
+                    ) + i128::from(
+                        rent.minimum_balance(
+                            UpgradeableLoaderState::size_of_programdata_metadata() + elf.len(),
+                        )
+                        .max(1),
+                    ) - i128::from(old_program.lamports())
+                        - i128::from(source.lamports())
+                } else {
+                    0
+                };
+                assert_eq!(migration_delta, expected_delta);
+                assert_eq!(migration_delta, if succeeds { -13_780_800 } else { 0 });
+                let actual = child.create_program_runtime_environment(&child.feature_set);
+                assert_eq!(
+                    *child.transaction_processor.program_runtime_environment,
+                    *actual
+                );
+                assert_eq!(
+                    parent.transaction_processor.program_runtime_environment,
+                    inherited
+                );
+                let entries = child
+                    .transaction_processor
+                    .global_program_cache
+                    .read()
+                    .unwrap()
+                    .get_flattened_entries();
+                let entry = entries.iter().find(|(id, _, _)| *id == program);
+                if succeeds {
+                    let p = child.get_account(&program).unwrap();
+                    let pd = child.get_account(&programdata).unwrap();
+                    assert_eq!(p.owner(), &bpf_loader_upgradeable::id());
+                    assert!(p.executable());
+                    assert_eq!(
+                        p.data(),
+                        bincode::serialize(&UpgradeableLoaderState::Program {
+                            programdata_address: programdata
+                        })
+                        .unwrap()
+                    );
+                    assert_eq!(p.lamports(), rent.minimum_balance(p.data().len()).max(1));
+                    assert_eq!(pd.owner(), &bpf_loader_upgradeable::id());
+                    assert_eq!(
+                        &pd.data()[UpgradeableLoaderState::size_of_programdata_metadata()..],
+                        elf
+                    );
+                    assert_eq!(
+                        bincode::deserialize::<UpgradeableLoaderState>(pd.data()).unwrap(),
+                        UpgradeableLoaderState::ProgramData {
+                            slot: 32,
+                            upgrade_authority_address: None
+                        }
+                    );
+                    assert_eq!(pd.lamports(), rent.minimum_balance(pd.data().len()).max(1));
+                    assert!(child.get_account(&buffer).is_none());
+                    let entry = &entry.unwrap().2;
+                    assert_eq!(entry.program.get_environment(), Some(selected));
+                    assert_eq!((entry.deployment_slot, entry.effective_slot), (32, 33));
+                    assert_eq!(entry.account_size, p.data().len() + pd.data().len());
+                } else {
+                    assert_eq!(child.get_account(&program), Some(old_program.clone()));
+                    assert_eq!(child.get_account(&buffer), Some(source.clone()));
+                    assert_eq!(child.get_account(&programdata), None);
+                    assert!(entry.is_none());
+                }
+                assert_eq!(parent.get_account(&program), Some(old_program));
+                assert_eq!(parent.get_account(&buffer), Some(source));
+                if parent_disabled && succeeds {
+                    let child = bank_forks
+                        .write()
+                        .unwrap()
+                        .insert(child)
+                        .clone_without_scheduler();
+                    let next = Bank::new_from_parent(child, SlotLeader::new_unique(), 33);
+                    let next = bank_forks
+                        .write()
+                        .unwrap()
+                        .insert(next)
+                        .clone_without_scheduler();
+                    let tx = Transaction::new_signed_with_payer(
+                        &[
+                            Instruction::new_with_bytes(program, &[], vec![]),
+                            solana_system_interface::instruction::transfer(
+                                &payer.pubkey(),
+                                &sink,
+                                1_000_000,
+                            ),
+                        ],
+                        Some(&payer.pubkey()),
+                        &[&payer],
+                        next.last_blockhash(),
+                    );
+                    assert_eq!(next.process_transaction(&tx), Ok(()));
+                    assert_eq!(next.get_balance(&sink), 1_000_000);
+                }
+                println!(
+                    "migration_env parent_disabled={parent_disabled} prediction_epoch={prediction_epoch} prediction_disabled={prediction_disabled:?} child_epoch=1 migrated={succeeds} migration_cap_delta={migration_delta} elf_len={}",
+                    elf.len()
+                );
+            }
+        }
+    }
+
     pub(crate) struct TestContext {
         target_program_address: Pubkey,
         source_buffer_address: Pubkey,
