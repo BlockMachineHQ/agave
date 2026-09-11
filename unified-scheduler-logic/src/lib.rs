@@ -1190,6 +1190,38 @@ impl SchedulingStateMachine {
         })
     }
 
+    /// Selects the next runnable task, preferring already-unblocked work over new input.
+    ///
+    /// Does not call `next_input` when the configured running-task limit is reached or
+    /// an unblocked task is available. Otherwise, pulls and admits inputs in callback
+    /// order until one runs or the callback returns `None`. Blocked inputs remain in
+    /// the existing usage queues; configured active-task caps and duplicate dropping
+    /// apply exactly as in [`schedule_or_buffer_task()`](Self::schedule_or_buffer_task).
+    /// No additional input queue is maintained here.
+    ///
+    /// The callback can lazily create tasks using the caller's address-to-usage-queue
+    /// mapping. It should return `None` rather than wait when no input is available.
+    /// A `None` result does not imply that all active tasks have completed. Returned
+    /// tasks must be descheduled exactly once, after their execution effects finish.
+    #[must_use]
+    pub fn schedule_next_task(
+        &mut self,
+        mut next_input: impl FnMut() -> Option<Task>,
+    ) -> Option<Task> {
+        if !self.is_task_runnable() {
+            return None;
+        }
+        if let Some(task) = self.schedule_next_unblocked_task() {
+            return Some(task);
+        }
+        loop {
+            let task = next_input()?;
+            if let Some(task) = self.schedule_or_buffer_task(task, false) {
+                return Some(task);
+            }
+        }
+    }
+
     #[must_use]
     pub fn schedule_next_unblocked_task(&mut self) -> Option<Task> {
         if !self.is_task_runnable() {

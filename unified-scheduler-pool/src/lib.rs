@@ -1354,7 +1354,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 assert_matches!(dummy, Err(RecvError));
 
                                 let task = state_machine
-                                    .schedule_next_unblocked_task()
+                                    .schedule_next_task(|| None)
                                     .expect("unblocked task");
                                 runnable_task_sender.send_payload(task).unwrap();
                             },
@@ -1366,11 +1366,18 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                         let task_id = task.task_id();
                                         sleepless_testing::at(CheckPoint::NewTask(task_id));
 
-                                        if let Some(task) = state_machine.schedule_or_buffer_task(task, session_ending) {
+                                        // The biased unblocked selector above has precedence, so
+                                        // there is no ready-unblocked work here. Verification has
+                                        // no running-task cap, and this arm asserts !session_ending.
+                                        // Admit only this selected message: polling further input
+                                        // here would bypass completion/control-message priorities.
+                                        let mut input = Some(task);
+                                        if let Some(task) = state_machine.schedule_next_task(|| input.take()) {
                                             runnable_task_sender.send_aux_payload(task).unwrap();
                                         } else {
                                             sleepless_testing::at(CheckPoint::BufferedOrDroppedTask(task_id));
                                         }
+                                        assert!(input.is_none(), "selected input must be admitted");
                                     }
                                     Ok(NewTaskPayload::CloseSubchannel) => {
                                         sleepless_testing::at(CheckPoint::SessionEnding);
