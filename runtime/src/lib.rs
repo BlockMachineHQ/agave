@@ -6,6 +6,9 @@
 mod account_saver;
 #[cfg(feature = "dev-context-only-utils")]
 pub mod account_saver;
+/// Native Bank write selection, shared with storage-independent replay.
+/// Preserves transaction order and borrows accounts without storing or deduplicating them.
+pub use account_saver::collect_accounts_to_store;
 pub mod accounts_background_service;
 mod alpenglow_epoch_type;
 pub mod bank;

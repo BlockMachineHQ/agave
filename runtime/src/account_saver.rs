@@ -227,6 +227,63 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_accounts_to_store_public_export_preserves_order_and_borrows() {
+        let payer = Keypair::new();
+        let tx = new_sanitized_tx(
+            &[&payer],
+            Message::new(&[], Some(&payer.pubkey())),
+            Hash::default(),
+        );
+        let txs = vec![tx.clone(), tx.clone(), tx];
+        let fees_only = |rollback_accounts| {
+            let fees_only = FeesOnlyTransaction {
+                load_error: TransactionError::AccountNotFound,
+                rollback_accounts,
+                fee_details: FeeDetails::default(),
+                loaded_accounts_data_size: 0,
+            };
+            Ok(ProcessedTransaction::FeesOnly(Box::new(fees_only)))
+        };
+        let results = vec![
+            fees_only(RollbackAccounts::FeePayerOnly {
+                fee_payer: (
+                    payer.pubkey(),
+                    AccountSharedData::new(9, 0, &Pubkey::default()),
+                ),
+            }),
+            Err(TransactionError::BlockhashNotFound),
+            fees_only(RollbackAccounts::SameNonceAndFeePayer {
+                nonce: (
+                    payer.pubkey(),
+                    AccountSharedData::new(7, 0, &Pubkey::default()),
+                ),
+            }),
+        ];
+        for collect_transactions in [false, true] {
+            let refs = collect_transactions.then(|| txs.iter().collect::<Vec<_>>());
+            let (accounts, transactions) = crate::collect_accounts_to_store(&txs, &refs, &results);
+            assert_eq!(accounts.len(), 2, "selection must not deduplicate");
+            assert_eq!(accounts[0].1.lamports(), 9);
+            assert_eq!(accounts[1].1.lamports(), 7);
+            for (selected, result_index) in accounts.iter().zip([0, 2]) {
+                let Ok(ProcessedTransaction::FeesOnly(result)) = &results[result_index] else {
+                    unreachable!()
+                };
+                assert!(std::ptr::eq(
+                    selected.1,
+                    &result.rollback_accounts.fee_payer().1
+                ));
+            }
+            if let Some(transactions) = transactions {
+                assert!(std::ptr::eq(transactions[0], &txs[0]));
+                assert!(std::ptr::eq(transactions[1], &txs[2]));
+            } else {
+                assert!(!collect_transactions);
+            }
+        }
+    }
+
+    #[test]
     fn test_collect_accounts_to_store() {
         let keypair0 = Keypair::new();
         let keypair1 = Keypair::new();
