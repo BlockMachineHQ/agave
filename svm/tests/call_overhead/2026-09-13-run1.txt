@@ -1,0 +1,260 @@
+
+running 1 test
+test call_overhead::bench_warmed_singleton_vs_small_batches ... width=1 n=256 repeats=64 rounds=12 arch=aarch64
+workload=builtin-transfer
+diagnostic batch=1 backing_reads=768 cache_uses_delta=256 cache_hits_delta=1280
+diagnostic batch=2 backing_reads=640 cache_uses_delta=256 cache_hits_delta=1280
+diagnostic batch=4 backing_reads=576 cache_uses_delta=256 cache_hits_delta=1280
+diagnostic batch=8 backing_reads=544 cache_uses_delta=256 cache_hits_delta=1280
+diagnostic batch=16 backing_reads=528 cache_uses_delta=256 cache_hits_delta=1280
+equivalence=exact_loaded_transactions_execution_details_inspections; backing_image=unchanged
+sample sbf=false round=0 pair=2 batch=1 ns_per_tx=1901.479 validate_ns=3.967 load_ns=5.798 execute_ns=1015.991 cache_ns=0.916
+sample sbf=false round=0 pair=2 batch=2 ns_per_tx=1670.216 validate_ns=2.319 load_ns=2.502 execute_ns=1003.235 cache_ns=0.000
+sample sbf=false round=0 pair=4 batch=1 ns_per_tx=1830.211 validate_ns=0.793 load_ns=0.122 execute_ns=1006.714 cache_ns=0.122
+sample sbf=false round=0 pair=4 batch=4 ns_per_tx=1626.156 validate_ns=0.061 load_ns=0.793 execute_ns=1002.625 cache_ns=0.000
+sample sbf=false round=0 pair=8 batch=1 ns_per_tx=1845.332 validate_ns=3.235 load_ns=6.165 execute_ns=1009.827 cache_ns=0.000
+sample sbf=false round=0 pair=8 batch=8 ns_per_tx=1608.167 validate_ns=0.122 load_ns=0.610 execute_ns=1005.371 cache_ns=0.000
+sample sbf=false round=0 pair=16 batch=1 ns_per_tx=1853.000 validate_ns=1.587 load_ns=4.211 execute_ns=1007.751 cache_ns=0.000
+sample sbf=false round=0 pair=16 batch=16 ns_per_tx=1571.379 validate_ns=3.723 load_ns=3.235 execute_ns=1005.798 cache_ns=0.000
+sample sbf=false round=1 pair=16 batch=16 ns_per_tx=1586.582 validate_ns=0.000 load_ns=1.099 execute_ns=1001.953 cache_ns=0.000
+sample sbf=false round=1 pair=16 batch=1 ns_per_tx=1831.679 validate_ns=1.099 load_ns=0.916 execute_ns=1004.944 cache_ns=0.000
+sample sbf=false round=1 pair=8 batch=8 ns_per_tx=1627.052 validate_ns=0.122 load_ns=0.122 execute_ns=1005.920 cache_ns=0.000
+sample sbf=false round=1 pair=8 batch=1 ns_per_tx=1834.293 validate_ns=3.845 load_ns=4.944 execute_ns=1013.123 cache_ns=0.061
+sample sbf=false round=1 pair=4 batch=4 ns_per_tx=1637.990 validate_ns=3.723 load_ns=3.906 execute_ns=1008.850 cache_ns=0.000
+sample sbf=false round=1 pair=4 batch=1 ns_per_tx=1833.177 validate_ns=2.441 load_ns=2.014 execute_ns=1004.089 cache_ns=0.000
+sample sbf=false round=1 pair=2 batch=2 ns_per_tx=1713.960 validate_ns=0.122 load_ns=0.488 execute_ns=1002.197 cache_ns=0.000
+sample sbf=false round=1 pair=2 batch=1 ns_per_tx=1852.976 validate_ns=0.122 load_ns=0.793 execute_ns=1001.953 cache_ns=0.000
+sample sbf=false round=2 pair=2 batch=1 ns_per_tx=1842.079 validate_ns=0.000 load_ns=0.732 execute_ns=1003.418 cache_ns=0.000
+sample sbf=false round=2 pair=2 batch=2 ns_per_tx=1727.220 validate_ns=0.000 load_ns=0.793 execute_ns=1002.991 cache_ns=0.000
+sample sbf=false round=2 pair=4 batch=1 ns_per_tx=1832.956 validate_ns=0.793 load_ns=1.465 execute_ns=1004.822 cache_ns=0.000
+sample sbf=false round=2 pair=4 batch=4 ns_per_tx=1618.694 validate_ns=0.000 load_ns=0.549 execute_ns=1007.019 cache_ns=0.000
+sample sbf=false round=2 pair=8 batch=1 ns_per_tx=1836.362 validate_ns=2.808 load_ns=2.380 execute_ns=1005.737 cache_ns=0.000
+sample sbf=false round=2 pair=8 batch=8 ns_per_tx=1599.599 validate_ns=3.967 load_ns=3.662 execute_ns=1008.911 cache_ns=0.366
+sample sbf=false round=2 pair=16 batch=1 ns_per_tx=1813.827 validate_ns=0.000 load_ns=0.305 execute_ns=1003.662 cache_ns=0.000
+sample sbf=false round=2 pair=16 batch=16 ns_per_tx=1581.376 validate_ns=4.517 load_ns=3.723 execute_ns=1005.981 cache_ns=0.000
+sample sbf=false round=3 pair=16 batch=16 ns_per_tx=1582.792 validate_ns=2.075 load_ns=5.371 execute_ns=1005.676 cache_ns=0.000
+sample sbf=false round=3 pair=16 batch=1 ns_per_tx=1834.304 validate_ns=0.488 load_ns=0.000 execute_ns=1001.953 cache_ns=0.000
+sample sbf=false round=3 pair=8 batch=8 ns_per_tx=1594.804 validate_ns=3.235 load_ns=4.028 execute_ns=1007.324 cache_ns=0.000
+sample sbf=false round=3 pair=8 batch=1 ns_per_tx=1814.086 validate_ns=1.404 load_ns=2.319 execute_ns=1007.996 cache_ns=0.061
+sample sbf=false round=3 pair=4 batch=4 ns_per_tx=1621.856 validate_ns=1.831 load_ns=4.028 execute_ns=1008.423 cache_ns=0.000
+sample sbf=false round=3 pair=4 batch=1 ns_per_tx=1830.028 validate_ns=0.854 load_ns=1.282 execute_ns=1003.479 cache_ns=0.000
+sample sbf=false round=3 pair=2 batch=2 ns_per_tx=1700.627 validate_ns=4.517 load_ns=3.296 execute_ns=1008.667 cache_ns=0.366
+sample sbf=false round=3 pair=2 batch=1 ns_per_tx=1805.438 validate_ns=1.465 load_ns=1.709 execute_ns=1003.113 cache_ns=1.099
+sample sbf=false round=4 pair=2 batch=1 ns_per_tx=1828.188 validate_ns=1.038 load_ns=0.916 execute_ns=1002.380 cache_ns=0.000
+sample sbf=false round=4 pair=2 batch=2 ns_per_tx=1706.235 validate_ns=2.319 load_ns=3.113 execute_ns=1005.432 cache_ns=0.061
+sample sbf=false round=4 pair=4 batch=1 ns_per_tx=1839.958 validate_ns=1.770 load_ns=4.028 execute_ns=1003.235 cache_ns=0.000
+sample sbf=false round=4 pair=4 batch=4 ns_per_tx=1651.571 validate_ns=0.000 load_ns=0.793 execute_ns=1006.042 cache_ns=0.000
+sample sbf=false round=4 pair=8 batch=1 ns_per_tx=1844.526 validate_ns=2.319 load_ns=1.343 execute_ns=1006.653 cache_ns=0.549
+sample sbf=false round=4 pair=8 batch=8 ns_per_tx=1597.361 validate_ns=0.793 load_ns=0.366 execute_ns=1004.517 cache_ns=0.000
+sample sbf=false round=4 pair=16 batch=1 ns_per_tx=1843.799 validate_ns=2.686 load_ns=5.676 execute_ns=1010.742 cache_ns=0.000
+sample sbf=false round=4 pair=16 batch=16 ns_per_tx=1605.589 validate_ns=0.000 load_ns=0.916 execute_ns=1002.930 cache_ns=0.000
+sample sbf=false round=5 pair=16 batch=16 ns_per_tx=1575.136 validate_ns=1.160 load_ns=0.183 execute_ns=1002.747 cache_ns=0.000
+sample sbf=false round=5 pair=16 batch=1 ns_per_tx=1853.756 validate_ns=2.625 load_ns=3.052 execute_ns=1008.240 cache_ns=0.061
+sample sbf=false round=5 pair=8 batch=8 ns_per_tx=1619.563 validate_ns=0.000 load_ns=0.061 execute_ns=1000.854 cache_ns=0.000
+sample sbf=false round=5 pair=8 batch=1 ns_per_tx=1873.971 validate_ns=1.770 load_ns=2.563 execute_ns=1010.132 cache_ns=0.000
+sample sbf=false round=5 pair=4 batch=4 ns_per_tx=1628.573 validate_ns=0.183 load_ns=0.732 execute_ns=1007.568 cache_ns=0.427
+sample sbf=false round=5 pair=4 batch=1 ns_per_tx=1847.603 validate_ns=4.333 load_ns=4.333 execute_ns=1020.264 cache_ns=0.366
+sample sbf=false round=5 pair=2 batch=2 ns_per_tx=1700.520 validate_ns=0.977 load_ns=3.845 execute_ns=1007.935 cache_ns=0.000
+sample sbf=false round=5 pair=2 batch=1 ns_per_tx=1812.966 validate_ns=1.038 load_ns=3.052 execute_ns=1006.287 cache_ns=0.000
+sample sbf=false round=6 pair=2 batch=1 ns_per_tx=1842.527 validate_ns=3.052 load_ns=1.770 execute_ns=1004.517 cache_ns=0.000
+sample sbf=false round=6 pair=2 batch=2 ns_per_tx=1688.946 validate_ns=0.549 load_ns=0.061 execute_ns=1003.418 cache_ns=0.000
+sample sbf=false round=6 pair=4 batch=1 ns_per_tx=1811.695 validate_ns=2.502 load_ns=6.226 execute_ns=1005.188 cache_ns=0.000
+sample sbf=false round=6 pair=4 batch=4 ns_per_tx=1635.891 validate_ns=2.808 load_ns=2.930 execute_ns=1006.775 cache_ns=0.000
+sample sbf=false round=6 pair=8 batch=1 ns_per_tx=1832.447 validate_ns=3.052 load_ns=4.944 execute_ns=1011.780 cache_ns=0.000
+sample sbf=false round=6 pair=8 batch=8 ns_per_tx=1600.972 validate_ns=0.061 load_ns=0.000 execute_ns=1005.188 cache_ns=0.000
+sample sbf=false round=6 pair=16 batch=1 ns_per_tx=1825.671 validate_ns=2.930 load_ns=2.258 execute_ns=1005.432 cache_ns=0.000
+sample sbf=false round=6 pair=16 batch=16 ns_per_tx=1575.326 validate_ns=2.747 load_ns=3.418 execute_ns=1007.690 cache_ns=0.000
+sample sbf=false round=7 pair=16 batch=16 ns_per_tx=1567.104 validate_ns=4.700 load_ns=3.784 execute_ns=1004.028 cache_ns=0.061
+sample sbf=false round=7 pair=16 batch=1 ns_per_tx=1808.937 validate_ns=1.160 load_ns=0.366 execute_ns=1003.784 cache_ns=0.000
+sample sbf=false round=7 pair=8 batch=8 ns_per_tx=1590.284 validate_ns=0.000 load_ns=0.732 execute_ns=1001.343 cache_ns=0.427
+sample sbf=false round=7 pair=8 batch=1 ns_per_tx=1816.015 validate_ns=1.831 load_ns=3.662 execute_ns=1006.409 cache_ns=0.305
+sample sbf=false round=7 pair=4 batch=4 ns_per_tx=1627.302 validate_ns=1.099 load_ns=0.793 execute_ns=1003.967 cache_ns=0.977
+sample sbf=false round=7 pair=4 batch=1 ns_per_tx=1816.229 validate_ns=0.061 load_ns=2.502 execute_ns=1004.517 cache_ns=0.000
+sample sbf=false round=7 pair=2 batch=2 ns_per_tx=1675.395 validate_ns=2.014 load_ns=3.723 execute_ns=1008.911 cache_ns=0.061
+sample sbf=false round=7 pair=2 batch=1 ns_per_tx=1815.878 validate_ns=2.686 load_ns=3.174 execute_ns=1008.972 cache_ns=0.488
+sample sbf=false round=8 pair=2 batch=1 ns_per_tx=1805.058 validate_ns=1.648 load_ns=0.916 execute_ns=1003.357 cache_ns=0.000
+sample sbf=false round=8 pair=2 batch=2 ns_per_tx=1674.911 validate_ns=0.244 load_ns=0.000 execute_ns=1002.563 cache_ns=0.000
+sample sbf=false round=8 pair=4 batch=1 ns_per_tx=1808.887 validate_ns=0.122 load_ns=1.160 execute_ns=1003.601 cache_ns=0.000
+sample sbf=false round=8 pair=4 batch=4 ns_per_tx=1609.381 validate_ns=1.404 load_ns=0.671 execute_ns=1003.357 cache_ns=0.000
+sample sbf=false round=8 pair=8 batch=1 ns_per_tx=1848.200 validate_ns=0.244 load_ns=1.221 execute_ns=1004.639 cache_ns=0.000
+sample sbf=false round=8 pair=8 batch=8 ns_per_tx=1609.705 validate_ns=2.319 load_ns=7.568 execute_ns=1015.869 cache_ns=0.122
+sample sbf=false round=8 pair=16 batch=1 ns_per_tx=1844.009 validate_ns=2.075 load_ns=3.906 execute_ns=1006.836 cache_ns=0.000
+sample sbf=false round=8 pair=16 batch=16 ns_per_tx=1579.940 validate_ns=0.916 load_ns=1.099 execute_ns=1003.418 cache_ns=0.000
+sample sbf=false round=9 pair=16 batch=16 ns_per_tx=1578.532 validate_ns=2.747 load_ns=5.066 execute_ns=1009.094 cache_ns=0.000
+sample sbf=false round=9 pair=16 batch=1 ns_per_tx=1833.897 validate_ns=0.305 load_ns=0.732 execute_ns=1001.953 cache_ns=0.000
+sample sbf=false round=9 pair=8 batch=8 ns_per_tx=1616.682 validate_ns=0.000 load_ns=0.061 execute_ns=1006.592 cache_ns=0.000
+sample sbf=false round=9 pair=8 batch=1 ns_per_tx=1857.427 validate_ns=0.183 load_ns=1.343 execute_ns=1007.202 cache_ns=0.488
+sample sbf=false round=9 pair=4 batch=4 ns_per_tx=1663.742 validate_ns=2.441 load_ns=2.075 execute_ns=1009.949 cache_ns=0.000
+sample sbf=false round=9 pair=4 batch=1 ns_per_tx=1825.261 validate_ns=0.000 load_ns=0.671 execute_ns=1009.338 cache_ns=0.000
+sample sbf=false round=9 pair=2 batch=2 ns_per_tx=1681.763 validate_ns=0.061 load_ns=0.000 execute_ns=1003.540 cache_ns=0.000
+sample sbf=false round=9 pair=2 batch=1 ns_per_tx=1813.024 validate_ns=0.671 load_ns=0.305 execute_ns=1007.568 cache_ns=0.305
+sample sbf=false round=10 pair=2 batch=1 ns_per_tx=1799.482 validate_ns=1.465 load_ns=1.343 execute_ns=1007.935 cache_ns=0.122
+sample sbf=false round=10 pair=2 batch=2 ns_per_tx=1675.582 validate_ns=1.038 load_ns=0.732 execute_ns=1007.263 cache_ns=0.000
+sample sbf=false round=10 pair=4 batch=1 ns_per_tx=1806.433 validate_ns=0.000 load_ns=1.282 execute_ns=1004.028 cache_ns=0.000
+sample sbf=false round=10 pair=4 batch=4 ns_per_tx=1628.011 validate_ns=3.052 load_ns=2.686 execute_ns=1009.338 cache_ns=0.061
+sample sbf=false round=10 pair=8 batch=1 ns_per_tx=1812.608 validate_ns=0.671 load_ns=0.610 execute_ns=1007.812 cache_ns=0.000
+sample sbf=false round=10 pair=8 batch=8 ns_per_tx=1596.591 validate_ns=0.000 load_ns=0.977 execute_ns=1001.831 cache_ns=0.000
+sample sbf=false round=10 pair=16 batch=1 ns_per_tx=1816.516 validate_ns=0.610 load_ns=2.197 execute_ns=1001.831 cache_ns=0.366
+sample sbf=false round=10 pair=16 batch=16 ns_per_tx=1561.806 validate_ns=3.479 load_ns=1.099 execute_ns=1007.446 cache_ns=0.122
+sample sbf=false round=11 pair=16 batch=16 ns_per_tx=1580.093 validate_ns=0.916 load_ns=0.000 execute_ns=1008.423 cache_ns=0.000
+sample sbf=false round=11 pair=16 batch=1 ns_per_tx=1837.851 validate_ns=0.610 load_ns=0.488 execute_ns=1004.578 cache_ns=0.000
+sample sbf=false round=11 pair=8 batch=8 ns_per_tx=1579.555 validate_ns=0.061 load_ns=0.061 execute_ns=1003.723 cache_ns=0.000
+sample sbf=false round=11 pair=8 batch=1 ns_per_tx=1839.435 validate_ns=0.610 load_ns=1.953 execute_ns=1004.822 cache_ns=0.000
+sample sbf=false round=11 pair=4 batch=4 ns_per_tx=1631.221 validate_ns=6.592 load_ns=7.019 execute_ns=1011.169 cache_ns=0.000
+sample sbf=false round=11 pair=4 batch=1 ns_per_tx=1834.422 validate_ns=0.305 load_ns=0.732 execute_ns=1003.113 cache_ns=0.000
+sample sbf=false round=11 pair=2 batch=2 ns_per_tx=1669.237 validate_ns=2.258 load_ns=4.395 execute_ns=1009.216 cache_ns=0.061
+sample sbf=false round=11 pair=2 batch=1 ns_per_tx=1821.491 validate_ns=0.244 load_ns=1.160 execute_ns=1005.981 cache_ns=0.549
+empty sbf=false round=0 ns_per_call=67.258
+empty sbf=false round=1 ns_per_call=69.410
+empty sbf=false round=2 ns_per_call=71.307
+empty sbf=false round=3 ns_per_call=71.823
+empty sbf=false round=4 ns_per_call=66.951
+empty sbf=false round=5 ns_per_call=67.337
+empty sbf=false round=6 ns_per_call=67.129
+empty sbf=false round=7 ns_per_call=69.310
+empty sbf=false round=8 ns_per_call=67.154
+empty sbf=false round=9 ns_per_call=67.154
+empty sbf=false round=10 ns_per_call=71.917
+empty sbf=false round=11 ns_per_call=72.502
+builtin_clone sbf=false round=0 ns_per_call=39.790
+builtin_clone sbf=false round=1 ns_per_call=38.892
+builtin_clone sbf=false round=2 ns_per_call=39.767
+builtin_clone sbf=false round=3 ns_per_call=39.645
+builtin_clone sbf=false round=4 ns_per_call=40.375
+builtin_clone sbf=false round=5 ns_per_call=39.190
+builtin_clone sbf=false round=6 ns_per_call=39.167
+builtin_clone sbf=false round=7 ns_per_call=39.205
+builtin_clone sbf=false round=8 ns_per_call=39.747
+builtin_clone sbf=false round=9 ns_per_call=39.179
+builtin_clone sbf=false round=10 ns_per_call=39.370
+builtin_clone sbf=false round=11 ns_per_call=39.508
+workload=sbf-write
+diagnostic batch=1 backing_reads=1024 cache_uses_delta=256 cache_hits_delta=1536
+diagnostic batch=2 backing_reads=768 cache_uses_delta=256 cache_hits_delta=1536
+diagnostic batch=4 backing_reads=640 cache_uses_delta=256 cache_hits_delta=1536
+diagnostic batch=8 backing_reads=576 cache_uses_delta=256 cache_hits_delta=1536
+diagnostic batch=16 backing_reads=544 cache_uses_delta=256 cache_hits_delta=1536
+equivalence=exact_loaded_transactions_execution_details_inspections; backing_image=unchanged
+sample sbf=true round=0 pair=2 batch=1 ns_per_tx=7588.550 validate_ns=8.972 load_ns=15.686 execute_ns=6143.860 cache_ns=1.038
+sample sbf=true round=0 pair=2 batch=2 ns_per_tx=7231.830 validate_ns=18.250 load_ns=22.156 execute_ns=6125.244 cache_ns=0.793
+sample sbf=true round=0 pair=4 batch=1 ns_per_tx=7553.498 validate_ns=2.319 load_ns=4.028 execute_ns=6165.283 cache_ns=0.916
+sample sbf=true round=0 pair=4 batch=4 ns_per_tx=7034.411 validate_ns=2.808 load_ns=3.967 execute_ns=6112.732 cache_ns=0.000
+sample sbf=true round=0 pair=8 batch=1 ns_per_tx=7547.369 validate_ns=0.000 load_ns=2.441 execute_ns=6165.894 cache_ns=0.854
+sample sbf=true round=0 pair=8 batch=8 ns_per_tx=7046.601 validate_ns=7.690 load_ns=9.155 execute_ns=6128.174 cache_ns=0.305
+sample sbf=true round=0 pair=16 batch=1 ns_per_tx=7556.796 validate_ns=15.686 load_ns=17.639 execute_ns=6141.602 cache_ns=0.977
+sample sbf=true round=0 pair=16 batch=16 ns_per_tx=6985.468 validate_ns=1.831 load_ns=11.658 execute_ns=6114.624 cache_ns=0.000
+sample sbf=true round=1 pair=16 batch=16 ns_per_tx=6974.618 validate_ns=12.634 load_ns=21.057 execute_ns=6106.384 cache_ns=0.427
+sample sbf=true round=1 pair=16 batch=1 ns_per_tx=7613.372 validate_ns=4.272 load_ns=6.409 execute_ns=6204.163 cache_ns=0.122
+sample sbf=true round=1 pair=8 batch=8 ns_per_tx=7132.004 validate_ns=4.456 load_ns=9.216 execute_ns=6176.880 cache_ns=1.160
+sample sbf=true round=1 pair=8 batch=1 ns_per_tx=7624.904 validate_ns=23.865 load_ns=36.743 execute_ns=6185.364 cache_ns=1.099
+sample sbf=true round=1 pair=4 batch=4 ns_per_tx=7129.653 validate_ns=8.667 load_ns=13.916 execute_ns=6135.193 cache_ns=0.061
+sample sbf=true round=1 pair=4 batch=1 ns_per_tx=7687.868 validate_ns=21.851 load_ns=28.931 execute_ns=6194.336 cache_ns=0.122
+sample sbf=true round=1 pair=2 batch=2 ns_per_tx=7183.791 validate_ns=8.667 load_ns=7.019 execute_ns=6126.770 cache_ns=0.793
+sample sbf=true round=1 pair=2 batch=1 ns_per_tx=7503.463 validate_ns=6.409 load_ns=7.996 execute_ns=6139.526 cache_ns=0.916
+sample sbf=true round=2 pair=2 batch=1 ns_per_tx=7552.371 validate_ns=8.972 load_ns=17.822 execute_ns=6137.634 cache_ns=2.197
+sample sbf=true round=2 pair=2 batch=2 ns_per_tx=7512.435 validate_ns=24.780 load_ns=39.124 execute_ns=6265.198 cache_ns=0.977
+sample sbf=true round=2 pair=4 batch=1 ns_per_tx=7714.304 validate_ns=9.766 load_ns=15.076 execute_ns=6243.835 cache_ns=0.366
+sample sbf=true round=2 pair=4 batch=4 ns_per_tx=7225.817 validate_ns=13.123 load_ns=16.663 execute_ns=6167.786 cache_ns=0.488
+sample sbf=true round=2 pair=8 batch=1 ns_per_tx=7702.356 validate_ns=21.973 load_ns=28.870 execute_ns=6196.106 cache_ns=1.526
+sample sbf=true round=2 pair=8 batch=8 ns_per_tx=7219.952 validate_ns=13.000 load_ns=25.085 execute_ns=6242.432 cache_ns=0.244
+sample sbf=true round=2 pair=16 batch=1 ns_per_tx=7621.914 validate_ns=20.996 load_ns=30.884 execute_ns=6183.594 cache_ns=0.244
+sample sbf=true round=2 pair=16 batch=16 ns_per_tx=6971.181 validate_ns=2.991 load_ns=20.081 execute_ns=6114.624 cache_ns=0.549
+sample sbf=true round=3 pair=16 batch=16 ns_per_tx=7026.902 validate_ns=18.005 load_ns=21.240 execute_ns=6120.605 cache_ns=0.366
+sample sbf=true round=3 pair=16 batch=1 ns_per_tx=7572.181 validate_ns=8.057 load_ns=14.771 execute_ns=6152.771 cache_ns=0.000
+sample sbf=true round=3 pair=8 batch=8 ns_per_tx=7110.677 validate_ns=5.188 load_ns=12.939 execute_ns=6158.142 cache_ns=0.000
+sample sbf=true round=3 pair=8 batch=1 ns_per_tx=7545.504 validate_ns=19.043 load_ns=25.391 execute_ns=6140.259 cache_ns=0.122
+sample sbf=true round=3 pair=4 batch=4 ns_per_tx=7100.028 validate_ns=7.568 load_ns=13.306 execute_ns=6120.850 cache_ns=0.000
+sample sbf=true round=3 pair=4 batch=1 ns_per_tx=7631.698 validate_ns=5.493 load_ns=10.132 execute_ns=6194.641 cache_ns=0.671
+sample sbf=true round=3 pair=2 batch=2 ns_per_tx=7228.729 validate_ns=12.878 load_ns=13.611 execute_ns=6127.014 cache_ns=0.122
+sample sbf=true round=3 pair=2 batch=1 ns_per_tx=7567.182 validate_ns=7.446 load_ns=9.399 execute_ns=6163.635 cache_ns=1.038
+sample sbf=true round=4 pair=2 batch=1 ns_per_tx=7582.871 validate_ns=5.798 load_ns=9.399 execute_ns=6176.208 cache_ns=0.000
+sample sbf=true round=4 pair=2 batch=2 ns_per_tx=7240.588 validate_ns=0.000 load_ns=1.465 execute_ns=6138.672 cache_ns=0.000
+sample sbf=true round=4 pair=4 batch=1 ns_per_tx=7678.573 validate_ns=10.681 load_ns=24.902 execute_ns=6215.088 cache_ns=1.831
+sample sbf=true round=4 pair=4 batch=4 ns_per_tx=7103.476 validate_ns=8.789 load_ns=19.043 execute_ns=6124.573 cache_ns=0.122
+sample sbf=true round=4 pair=8 batch=1 ns_per_tx=7628.397 validate_ns=5.920 load_ns=13.184 execute_ns=6176.697 cache_ns=0.916
+sample sbf=true round=4 pair=8 batch=8 ns_per_tx=7059.816 validate_ns=0.916 load_ns=2.197 execute_ns=6125.366 cache_ns=0.549
+sample sbf=true round=4 pair=16 batch=1 ns_per_tx=7572.915 validate_ns=7.141 load_ns=11.230 execute_ns=6176.208 cache_ns=1.526
+sample sbf=true round=4 pair=16 batch=16 ns_per_tx=6976.573 validate_ns=7.202 load_ns=6.531 execute_ns=6108.643 cache_ns=0.061
+sample sbf=true round=5 pair=16 batch=16 ns_per_tx=6954.410 validate_ns=0.549 load_ns=0.610 execute_ns=6115.234 cache_ns=0.000
+sample sbf=true round=5 pair=16 batch=1 ns_per_tx=7551.842 validate_ns=7.080 load_ns=6.042 execute_ns=6167.969 cache_ns=0.000
+sample sbf=true round=5 pair=8 batch=8 ns_per_tx=7044.842 validate_ns=15.808 load_ns=27.954 execute_ns=6106.995 cache_ns=1.343
+sample sbf=true round=5 pair=8 batch=1 ns_per_tx=7561.180 validate_ns=13.916 load_ns=14.221 execute_ns=6156.433 cache_ns=0.122
+sample sbf=true round=5 pair=4 batch=4 ns_per_tx=7107.106 validate_ns=15.320 load_ns=27.039 execute_ns=6110.901 cache_ns=0.183
+sample sbf=true round=5 pair=4 batch=1 ns_per_tx=7579.434 validate_ns=15.137 load_ns=20.691 execute_ns=6157.898 cache_ns=2.747
+sample sbf=true round=5 pair=2 batch=2 ns_per_tx=7240.842 validate_ns=4.761 load_ns=7.874 execute_ns=6139.038 cache_ns=0.793
+sample sbf=true round=5 pair=2 batch=1 ns_per_tx=7599.873 validate_ns=0.671 load_ns=2.808 execute_ns=6174.988 cache_ns=0.000
+sample sbf=true round=6 pair=2 batch=1 ns_per_tx=7531.996 validate_ns=5.676 load_ns=7.507 execute_ns=6153.625 cache_ns=0.061
+sample sbf=true round=6 pair=2 batch=2 ns_per_tx=7252.656 validate_ns=0.061 load_ns=1.099 execute_ns=6134.155 cache_ns=0.000
+sample sbf=true round=6 pair=4 batch=1 ns_per_tx=7673.850 validate_ns=17.334 load_ns=31.616 execute_ns=6218.140 cache_ns=2.380
+sample sbf=true round=6 pair=4 batch=4 ns_per_tx=7169.748 validate_ns=3.662 load_ns=7.141 execute_ns=6167.542 cache_ns=0.366
+sample sbf=true round=6 pair=8 batch=1 ns_per_tx=7697.311 validate_ns=8.362 load_ns=13.489 execute_ns=6242.493 cache_ns=1.587
+sample sbf=true round=6 pair=8 batch=8 ns_per_tx=7093.890 validate_ns=10.742 load_ns=15.381 execute_ns=6135.803 cache_ns=0.610
+sample sbf=true round=6 pair=16 batch=1 ns_per_tx=7789.003 validate_ns=10.864 load_ns=14.160 execute_ns=6261.230 cache_ns=0.488
+sample sbf=true round=6 pair=16 batch=16 ns_per_tx=7071.099 validate_ns=9.277 load_ns=15.930 execute_ns=6145.020 cache_ns=0.000
+sample sbf=true round=7 pair=16 batch=16 ns_per_tx=7071.320 validate_ns=12.756 load_ns=21.240 execute_ns=6169.800 cache_ns=0.000
+sample sbf=true round=7 pair=16 batch=1 ns_per_tx=7549.642 validate_ns=14.832 load_ns=17.761 execute_ns=6163.940 cache_ns=0.183
+sample sbf=true round=7 pair=8 batch=8 ns_per_tx=7109.490 validate_ns=20.081 load_ns=24.963 execute_ns=6155.090 cache_ns=0.183
+sample sbf=true round=7 pair=8 batch=1 ns_per_tx=7732.354 validate_ns=10.071 load_ns=16.113 execute_ns=6268.738 cache_ns=1.404
+sample sbf=true round=7 pair=4 batch=4 ns_per_tx=7224.882 validate_ns=12.085 load_ns=20.386 execute_ns=6169.128 cache_ns=0.000
+sample sbf=true round=7 pair=4 batch=1 ns_per_tx=7569.670 validate_ns=17.639 load_ns=26.367 execute_ns=6151.062 cache_ns=0.916
+sample sbf=true round=7 pair=2 batch=2 ns_per_tx=7294.146 validate_ns=11.658 load_ns=19.470 execute_ns=6141.174 cache_ns=1.831
+sample sbf=true round=7 pair=2 batch=1 ns_per_tx=7602.292 validate_ns=26.733 load_ns=39.917 execute_ns=6163.940 cache_ns=1.892
+sample sbf=true round=8 pair=2 batch=1 ns_per_tx=7591.206 validate_ns=7.080 load_ns=7.874 execute_ns=6184.082 cache_ns=0.061
+sample sbf=true round=8 pair=2 batch=2 ns_per_tx=7260.272 validate_ns=0.610 load_ns=2.869 execute_ns=6146.973 cache_ns=0.000
+sample sbf=true round=8 pair=4 batch=1 ns_per_tx=7585.618 validate_ns=8.972 load_ns=14.832 execute_ns=6164.185 cache_ns=1.282
+sample sbf=true round=8 pair=4 batch=4 ns_per_tx=7171.590 validate_ns=13.733 load_ns=15.564 execute_ns=6134.583 cache_ns=0.000
+sample sbf=true round=8 pair=8 batch=1 ns_per_tx=7672.034 validate_ns=6.165 load_ns=8.057 execute_ns=6215.210 cache_ns=0.671
+sample sbf=true round=8 pair=8 batch=8 ns_per_tx=7042.585 validate_ns=5.920 load_ns=13.794 execute_ns=6119.263 cache_ns=0.122
+sample sbf=true round=8 pair=16 batch=1 ns_per_tx=7650.840 validate_ns=12.634 load_ns=17.761 execute_ns=6174.255 cache_ns=1.282
+sample sbf=true round=8 pair=16 batch=16 ns_per_tx=7126.598 validate_ns=19.409 load_ns=32.227 execute_ns=6153.687 cache_ns=0.793
+sample sbf=true round=9 pair=16 batch=16 ns_per_tx=7074.489 validate_ns=5.066 load_ns=9.277 execute_ns=6143.982 cache_ns=0.000
+sample sbf=true round=9 pair=16 batch=1 ns_per_tx=7591.947 validate_ns=24.597 load_ns=36.438 execute_ns=6149.231 cache_ns=1.343
+sample sbf=true round=9 pair=8 batch=8 ns_per_tx=7114.810 validate_ns=12.024 load_ns=23.743 execute_ns=6139.587 cache_ns=0.183
+sample sbf=true round=9 pair=8 batch=1 ns_per_tx=7674.881 validate_ns=15.442 load_ns=18.494 execute_ns=6210.999 cache_ns=1.038
+sample sbf=true round=9 pair=4 batch=4 ns_per_tx=7204.405 validate_ns=21.118 load_ns=32.715 execute_ns=6161.804 cache_ns=0.305
+sample sbf=true round=9 pair=4 batch=1 ns_per_tx=7641.758 validate_ns=19.897 load_ns=31.616 execute_ns=6176.819 cache_ns=0.305
+sample sbf=true round=9 pair=2 batch=2 ns_per_tx=7243.954 validate_ns=17.212 load_ns=17.212 execute_ns=6127.869 cache_ns=1.099
+sample sbf=true round=9 pair=2 batch=1 ns_per_tx=7565.357 validate_ns=17.700 load_ns=16.296 execute_ns=6154.663 cache_ns=0.122
+sample sbf=true round=10 pair=2 batch=1 ns_per_tx=7556.925 validate_ns=5.554 load_ns=6.287 execute_ns=6169.678 cache_ns=0.610
+sample sbf=true round=10 pair=2 batch=2 ns_per_tx=7230.015 validate_ns=0.061 load_ns=1.343 execute_ns=6137.939 cache_ns=0.122
+sample sbf=true round=10 pair=4 batch=1 ns_per_tx=7609.295 validate_ns=9.583 load_ns=8.667 execute_ns=6171.997 cache_ns=1.709
+sample sbf=true round=10 pair=4 batch=4 ns_per_tx=7139.942 validate_ns=7.935 load_ns=9.460 execute_ns=6156.189 cache_ns=0.061
+sample sbf=true round=10 pair=8 batch=1 ns_per_tx=7644.514 validate_ns=8.484 load_ns=10.071 execute_ns=6199.524 cache_ns=0.000
+sample sbf=true round=10 pair=8 batch=8 ns_per_tx=7065.245 validate_ns=17.822 load_ns=30.273 execute_ns=6110.962 cache_ns=1.038
+sample sbf=true round=10 pair=16 batch=1 ns_per_tx=7608.488 validate_ns=0.732 load_ns=2.991 execute_ns=6193.848 cache_ns=0.732
+sample sbf=true round=10 pair=16 batch=16 ns_per_tx=7048.688 validate_ns=12.146 load_ns=17.761 execute_ns=6117.310 cache_ns=0.000
+sample sbf=true round=11 pair=16 batch=16 ns_per_tx=7088.907 validate_ns=6.470 load_ns=10.559 execute_ns=6137.085 cache_ns=0.305
+sample sbf=true round=11 pair=16 batch=1 ns_per_tx=7632.208 validate_ns=16.113 load_ns=17.761 execute_ns=6186.462 cache_ns=0.000
+sample sbf=true round=11 pair=8 batch=8 ns_per_tx=7090.523 validate_ns=18.372 load_ns=28.748 execute_ns=6127.991 cache_ns=0.305
+sample sbf=true round=11 pair=8 batch=1 ns_per_tx=7811.602 validate_ns=13.550 load_ns=24.414 execute_ns=6268.066 cache_ns=0.732
+sample sbf=true round=11 pair=4 batch=4 ns_per_tx=7337.693 validate_ns=23.621 load_ns=34.180 execute_ns=6228.088 cache_ns=2.075
+sample sbf=true round=11 pair=4 batch=1 ns_per_tx=7682.313 validate_ns=9.705 load_ns=19.531 execute_ns=6229.248 cache_ns=0.061
+sample sbf=true round=11 pair=2 batch=2 ns_per_tx=7285.922 validate_ns=6.042 load_ns=7.629 execute_ns=6156.677 cache_ns=0.305
+sample sbf=true round=11 pair=2 batch=1 ns_per_tx=7553.419 validate_ns=6.409 load_ns=7.812 execute_ns=6166.504 cache_ns=0.000
+empty sbf=true round=0 ns_per_call=67.879
+empty sbf=true round=1 ns_per_call=65.074
+empty sbf=true round=2 ns_per_call=63.680
+empty sbf=true round=3 ns_per_call=63.454
+empty sbf=true round=4 ns_per_call=65.168
+empty sbf=true round=5 ns_per_call=64.267
+empty sbf=true round=6 ns_per_call=64.176
+empty sbf=true round=7 ns_per_call=64.357
+empty sbf=true round=8 ns_per_call=63.962
+empty sbf=true round=9 ns_per_call=65.376
+empty sbf=true round=10 ns_per_call=63.980
+empty sbf=true round=11 ns_per_call=63.299
+builtin_clone sbf=true round=0 ns_per_call=38.132
+builtin_clone sbf=true round=1 ns_per_call=38.203
+builtin_clone sbf=true round=2 ns_per_call=38.139
+builtin_clone sbf=true round=3 ns_per_call=39.469
+builtin_clone sbf=true round=4 ns_per_call=39.619
+builtin_clone sbf=true round=5 ns_per_call=42.196
+builtin_clone sbf=true round=6 ns_per_call=41.247
+builtin_clone sbf=true round=7 ns_per_call=44.703
+builtin_clone sbf=true round=8 ns_per_call=42.193
+builtin_clone sbf=true round=9 ns_per_call=40.591
+builtin_clone sbf=true round=10 ns_per_call=40.141
+builtin_clone sbf=true round=11 ns_per_call=39.930
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 14.66s

@@ -79,6 +79,9 @@ use {
 // This module contains the implementation of TransactionProcessingCallback
 mod mock_bank;
 
+#[path = "call_overhead/mod.rs"]
+mod call_overhead;
+
 #[derive(Default)]
 struct ReceiptCache(Mutex<Vec<(VerifiedProgramReceipt, Arc<ProgramCacheEntry>)>>);
 impl ProgramLoadCache for ReceiptCache {

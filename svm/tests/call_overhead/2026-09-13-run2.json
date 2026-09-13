@@ -1,0 +1,494 @@
+{
+  "command": [
+    "/Users/aniket/Projects/BlockMachine/agave-night-svm/target-night-svm/release/deps/integration_test-bdca8f2243256485",
+    "call_overhead::bench_warmed_singleton_vs_small_batches",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "pairs": [
+    {
+      "sbf": "false",
+      "batch": 2,
+      "singleton_ns_per_tx": {
+        "median": 1852.4975,
+        "mean": 1855.7426666666665,
+        "stdev": 22.344837835141895,
+        "min": 1825.475,
+        "max": 1894.805,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 1706.008,
+        "mean": 1705.7054166666667,
+        "stdev": 11.965427093834933,
+        "min": 1684.555,
+        "max": 1725.247,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 152.6149999999999,
+        "mean": 150.03725,
+        "stdev": 30.03278899386474,
+        "min": 100.22799999999984,
+        "max": 205.23400000000015,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 8.204094482220334,
+        "mean": 8.069405182529172,
+        "stdev": 1.5253553785323333,
+        "min": 5.490516167025013,
+        "max": 10.831404814743477,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 3.0215,
+          "batched": 2.0145
+        },
+        "load_ns": {
+          "singleton": 2.7775,
+          "batched": 1.6175000000000002
+        },
+        "execute_ns": {
+          "singleton": 1007.7515,
+          "batched": 1006.653
+        },
+        "cache_ns": {
+          "singleton": 0.0,
+          "batched": 0.061
+        }
+      }
+    },
+    {
+      "sbf": "false",
+      "batch": 4,
+      "singleton_ns_per_tx": {
+        "median": 1834.772,
+        "mean": 1834.9890833333334,
+        "stdev": 12.286701979696549,
+        "min": 1806.471,
+        "max": 1851.97,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 1626.1460000000002,
+        "mean": 1623.4413333333334,
+        "stdev": 14.185567270570425,
+        "min": 1605.758,
+        "max": 1652.643,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 212.33450000000005,
+        "mean": 211.54774999999998,
+        "stdev": 18.786376524807,
+        "min": 179.92399999999998,
+        "max": 242.22000000000003,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 11.501036870918156,
+        "mean": 11.524894418803926,
+        "stdev": 0.9758366133523491,
+        "min": 9.818140346301115,
+        "max": 13.079045556893472,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 1.2515,
+          "batched": 3.9365
+        },
+        "load_ns": {
+          "singleton": 1.3735,
+          "batched": 2.0444999999999998
+        },
+        "execute_ns": {
+          "singleton": 1005.4929999999999,
+          "batched": 1005.8285
+        },
+        "cache_ns": {
+          "singleton": 0.0,
+          "batched": 0.0
+        }
+      }
+    },
+    {
+      "sbf": "false",
+      "batch": 8,
+      "singleton_ns_per_tx": {
+        "median": 1834.7325,
+        "mean": 1836.3168333333333,
+        "stdev": 15.26421978373156,
+        "min": 1815.959,
+        "max": 1866.891,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 1600.1970000000001,
+        "mean": 1598.4329166666666,
+        "stdev": 15.15956857420619,
+        "min": 1567.193,
+        "max": 1620.956,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 229.66550000000007,
+        "mean": 237.88391666666672,
+        "stdev": 25.28993707335477,
+        "min": 211.61000000000013,
+        "max": 299.6980000000001,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 12.518939785592732,
+        "mean": 12.946563825190832,
+        "stdev": 1.2761953590384145,
+        "min": 11.65279612590373,
+        "max": 16.053320734847407,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 1.77,
+          "batched": 0.1525
+        },
+        "load_ns": {
+          "singleton": 1.587,
+          "batched": 0.5185
+        },
+        "execute_ns": {
+          "singleton": 1005.9505,
+          "batched": 1005.4014999999999
+        },
+        "cache_ns": {
+          "singleton": 0.0,
+          "batched": 0.0
+        }
+      }
+    },
+    {
+      "sbf": "false",
+      "batch": 16,
+      "singleton_ns_per_tx": {
+        "median": 1842.3525,
+        "mean": 1842.6275833333334,
+        "stdev": 15.738770614217941,
+        "min": 1805.098,
+        "max": 1861.329,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 1578.9279999999999,
+        "mean": 1578.8516666666667,
+        "stdev": 11.49518534259478,
+        "min": 1566.145,
+        "max": 1603.598,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 262.46399999999994,
+        "mean": 263.77591666666666,
+        "stdev": 12.163239994929107,
+        "min": 237.43899999999985,
+        "max": 282.6590000000001,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 14.295424361537766,
+        "mean": 14.312570175117788,
+        "stdev": 0.5851009442162873,
+        "min": 13.153801067864453,
+        "max": 15.190791121315018,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 1.068,
+          "batched": 2.808
+        },
+        "load_ns": {
+          "singleton": 1.6785,
+          "batched": 2.472
+        },
+        "execute_ns": {
+          "singleton": 1006.8665,
+          "batched": 1006.2565
+        },
+        "cache_ns": {
+          "singleton": 0.0,
+          "batched": 0.0
+        }
+      }
+    },
+    {
+      "sbf": "true",
+      "batch": 2,
+      "singleton_ns_per_tx": {
+        "median": 7449.8845,
+        "mean": 7451.6695,
+        "stdev": 52.53519459891114,
+        "min": 7390.093,
+        "max": 7548.2,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 7168.3665,
+        "mean": 7174.8,
+        "stdev": 36.243648985969834,
+        "min": 7111.59,
+        "max": 7261.779,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 266.3624999999997,
+        "mean": 276.86949999999985,
+        "stdev": 52.771921975611384,
+        "min": 198.02699999999913,
+        "max": 381.6379999999999,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 3.5862190683895045,
+        "mean": 3.7122405204678772,
+        "stdev": 0.6836135170457349,
+        "min": 2.6545864597551083,
+        "max": 5.0560133541771535,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 17.273,
+          "batched": 16.936999999999998
+        },
+        "load_ns": {
+          "singleton": 16.144,
+          "batched": 17.058999999999997
+        },
+        "execute_ns": {
+          "singleton": 6141.2355,
+          "batched": 6057.312
+        },
+        "cache_ns": {
+          "singleton": 0.2135,
+          "batched": 0.183
+        }
+      }
+    },
+    {
+      "sbf": "true",
+      "batch": 4,
+      "singleton_ns_per_tx": {
+        "median": 7448.9855,
+        "mean": 7440.529583333333,
+        "stdev": 44.99890493709679,
+        "min": 7365.127,
+        "max": 7520.506,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 7008.0365,
+        "mean": 7008.605833333333,
+        "stdev": 29.742977245464935,
+        "min": 6955.96,
+        "max": 7052.126,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 440.8014999999996,
+        "mean": 431.92374999999987,
+        "stdev": 58.15316015039303,
+        "min": 334.0,
+        "max": 518.8800000000001,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 5.925548277712513,
+        "mean": 5.801456618033525,
+        "stdev": 0.753267407904924,
+        "min": 4.529342340848199,
+        "max": 6.922755797948071,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 9.1245,
+          "batched": 12.786999999999999
+        },
+        "load_ns": {
+          "singleton": 9.7655,
+          "batched": 16.7845
+        },
+        "execute_ns": {
+          "singleton": 6138.855,
+          "batched": 5974.9145
+        },
+        "cache_ns": {
+          "singleton": 0.244,
+          "batched": 0.061
+        }
+      }
+    },
+    {
+      "sbf": "true",
+      "batch": 8,
+      "singleton_ns_per_tx": {
+        "median": 7441.7105,
+        "mean": 7439.786916666667,
+        "stdev": 31.561703682723728,
+        "min": 7390.817,
+        "max": 7491.275,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 6968.2805,
+        "mean": 6967.9165,
+        "stdev": 37.322536985044486,
+        "min": 6912.824,
+        "max": 7050.475,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 480.60350000000017,
+        "mean": 471.8704166666667,
+        "stdev": 46.34260292147923,
+        "min": 370.1859999999997,
+        "max": 542.6280000000006,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 6.458773341967728,
+        "mean": 6.341179716583149,
+        "stdev": 0.6077611006015303,
+        "min": 4.988585248672587,
+        "max": 7.278270988801223,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 20.325,
+          "batched": 13.1835
+        },
+        "load_ns": {
+          "singleton": 21.0875,
+          "batched": 19.989
+        },
+        "execute_ns": {
+          "singleton": 6130.005,
+          "batched": 5955.9635
+        },
+        "cache_ns": {
+          "singleton": 0.3355,
+          "batched": 0.122
+        }
+      }
+    },
+    {
+      "sbf": "true",
+      "batch": 16,
+      "singleton_ns_per_tx": {
+        "median": 7427.8279999999995,
+        "mean": 7439.23525,
+        "stdev": 45.812873232759756,
+        "min": 7361.033,
+        "max": 7529.747,
+        "count": 12
+      },
+      "batched_ns_per_tx": {
+        "median": 6901.9745,
+        "mean": 6920.4279166666665,
+        "stdev": 49.60581540589075,
+        "min": 6854.984,
+        "max": 7017.605,
+        "count": 12
+      },
+      "paired_saved_ns_per_tx": {
+        "median": 532.7365000000004,
+        "mean": 518.8073333333335,
+        "stdev": 53.869045471964746,
+        "min": 384.366,
+        "max": 580.049,
+        "count": 12
+      },
+      "paired_reduction_percent": {
+        "median": 7.127726438523487,
+        "mean": 6.972071822142978,
+        "stdev": 0.7047796324546449,
+        "min": 5.192752038612419,
+        "max": 7.80156591100537,
+        "count": 12
+      },
+      "native_median_ns_per_tx": {
+        "validate_ns": {
+          "singleton": 13.977,
+          "batched": 12.451
+        },
+        "load_ns": {
+          "singleton": 16.936999999999998,
+          "batched": 14.679
+        },
+        "execute_ns": {
+          "singleton": 6137.3904999999995,
+          "batched": 5930.8475
+        },
+        "cache_ns": {
+          "singleton": 0.2135,
+          "batched": 0.0915
+        }
+      }
+    }
+  ],
+  "components": [
+    {
+      "component": "empty",
+      "sbf": "false",
+      "ns_per_call": {
+        "median": 70.4015,
+        "mean": 71.02183333333333,
+        "stdev": 2.1687779899512454,
+        "min": 68.743,
+        "max": 74.951,
+        "count": 12
+      }
+    },
+    {
+      "component": "builtin_clone",
+      "sbf": "false",
+      "ns_per_call": {
+        "median": 39.400999999999996,
+        "mean": 39.3395,
+        "stdev": 0.7946009289974668,
+        "min": 38.104,
+        "max": 40.451,
+        "count": 12
+      }
+    },
+    {
+      "component": "empty",
+      "sbf": "true",
+      "ns_per_call": {
+        "median": 64.3095,
+        "mean": 65.10708333333334,
+        "stdev": 1.9636979242945687,
+        "min": 63.253,
+        "max": 69.028,
+        "count": 12
+      }
+    },
+    {
+      "component": "builtin_clone",
+      "sbf": "true",
+      "ns_per_call": {
+        "median": 41.686,
+        "mean": 41.5925,
+        "stdev": 0.7352507920925541,
+        "min": 40.421,
+        "max": 42.592,
+        "count": 12
+      }
+    }
+  ]
+}
