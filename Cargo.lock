@@ -8338,6 +8338,7 @@ dependencies = [
  "assert_matches",
  "criterion",
  "crossbeam-channel",
+ "libc",
  "log",
  "num_cpus",
  "proptest",

@@ -52,6 +52,7 @@ agave-logger = { path = "../logger", features = ["agave-unstable-api"] }
 agave-reserved-account-keys = { path = "../reserved-account-keys", features = ["agave-unstable-api"] }
 assert_matches = { workspace = true }
 criterion = { workspace = true }
+libc = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
 solana-entry = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
@@ -63,6 +64,10 @@ solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-system-transaction = { workspace = true }
 solana-transaction = { workspace = true, features = ["verify"] }
+
+[[bench]]
+name = "verification_pool"
+harness = false
 
 [[bench]]
 name = "verify_signatures"
