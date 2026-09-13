@@ -23,7 +23,7 @@ use {
     solana_cost_model::{cost_model::CostModel, transaction_cost::TransactionCost},
     solana_entry::{
         block_component::BlockComponent,
-        entry::{self, Entry, EntrySlice, EntryType, create_ticks},
+        entry::{self, Entry, EntryType, create_ticks},
     },
     solana_genesis_config::GenesisConfig,
     solana_hash::Hash,
@@ -1071,55 +1071,26 @@ fn verify_ticks(
     tick_hash_count: &mut u64,
     migration_status: &MigrationStatus,
 ) -> std::result::Result<(), BlockError> {
-    let next_bank_tick_height = bank.tick_height() + entries.tick_count();
-    let max_bank_tick_height = bank.max_tick_height();
-
-    if next_bank_tick_height > max_bank_tick_height {
-        warn!("Too many entry ticks found in slot: {}", bank.slot());
-        return Err(BlockError::TooManyTicks);
-    }
-
-    if next_bank_tick_height < max_bank_tick_height && slot_full {
-        info!("Too few entry ticks found in slot: {}", bank.slot());
-        return Err(BlockError::TooFewTicks);
-    }
-
-    if next_bank_tick_height == max_bank_tick_height {
-        let has_trailing_entry = entries.last().map(|e| !e.is_tick()).unwrap_or_default();
-        if has_trailing_entry {
-            warn!("Slot: {} did not end with a tick entry", bank.slot());
-            return Err(BlockError::TrailingEntry);
-        }
-
-        if !slot_full {
-            warn!("Slot: {} was not marked full", bank.slot());
-            return Err(BlockError::InvalidLastTick);
-        }
-    }
-
-    if migration_status.should_have_alpenglow_ticks(bank.slot()) {
-        // When alpenglow is active, PoH MUST be in low power mode.
-        // We require that each block only has 1 tick at the very end
-        if entries.iter().any(|entry| entry.num_hashes != 1) {
-            warn!(
-                "Alpenglow entry with invalid num_hashes found in slot: {}",
-                bank.slot()
-            );
-            return Err(BlockError::InvalidTickHashCount);
-        }
-        return Ok(());
-    }
-
-    let hashes_per_tick = bank.hashes_per_tick().unwrap_or(0);
-    if !entries.verify_tick_hash_count(tick_hash_count, hashes_per_tick) {
-        warn!(
-            "Tick with invalid number of hashes found in slot: {}",
-            bank.slot()
-        );
-        return Err(BlockError::InvalidTickHashCount);
-    }
-
-    Ok(())
+    use solana_entry::tick_verification::{TickVerificationError, TickVerificationParams};
+    solana_entry::tick_verification::verify_ticks(
+        TickVerificationParams {
+            slot: bank.slot(),
+            tick_height: bank.tick_height(),
+            max_tick_height: bank.max_tick_height(),
+            hashes_per_tick: bank.hashes_per_tick(),
+            alpenglow_ticks: migration_status.should_have_alpenglow_ticks(bank.slot()),
+        },
+        entries,
+        slot_full,
+        tick_hash_count,
+    )
+    .map_err(|error| match error {
+        TickVerificationError::TooManyTicks => BlockError::TooManyTicks,
+        TickVerificationError::TooFewTicks => BlockError::TooFewTicks,
+        TickVerificationError::TrailingEntry => BlockError::TrailingEntry,
+        TickVerificationError::InvalidLastTick => BlockError::InvalidLastTick,
+        TickVerificationError::InvalidTickHashCount => BlockError::InvalidTickHashCount,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2959,6 +2930,54 @@ pub mod tests {
         test_case::test_matrix,
         trees::tr,
     };
+
+    #[test]
+    fn test_shared_tick_verification_actual_parent_and_skips() {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(10_000);
+        genesis_config.ticks_per_slot = 2;
+        genesis_config.poh_config.hashes_per_tick = Some(4);
+        for complete in [false, true] {
+            let (parent, _forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+            if complete {
+                for entry in create_ticks(2, 4, parent.last_blockhash()) {
+                    parent.register_tick_for_test(&entry.hash);
+                }
+            }
+            parent.freeze();
+            assert_eq!(parent.is_complete(), complete);
+            for slot in [1, 4] {
+                let child = Bank::new_from_parent(parent.clone(), SlotLeader::default(), slot);
+                let entries = create_ticks(slot * 2, 4, parent.last_blockhash());
+                let mut count = 0;
+                let result = verify_ticks(
+                    &child,
+                    &entries,
+                    true,
+                    &mut count,
+                    &MigrationStatus::default(),
+                );
+                assert_eq!(
+                    result,
+                    if complete {
+                        Ok(())
+                    } else {
+                        Err(BlockError::TooFewTicks)
+                    }
+                );
+                assert_eq!(count, 0);
+                // Structural error must outrank invalid hashes and leave the counter untouched.
+                let over = create_ticks(child.max_tick_height() + 1, 3, parent.last_blockhash());
+                count = 7;
+                assert_eq!(
+                    verify_ticks(&child, &over, true, &mut count, &MigrationStatus::default()),
+                    Err(BlockError::TooManyTicks)
+                );
+                assert_eq!(count, 7);
+            }
+        }
+    }
 
     /// Generate a dummy alpenglow genesis certificate
     fn genesis_certificate(genesis_block: Block) -> Arc<Certificate> {

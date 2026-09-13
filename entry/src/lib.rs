@@ -4,3 +4,4 @@ pub mod block_component;
 pub mod entry;
 pub mod entry_or_marker;
 pub mod poh;
+pub mod tick_verification;
