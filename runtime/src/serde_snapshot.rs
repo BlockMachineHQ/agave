@@ -511,6 +511,26 @@ pub struct DecodedSnapshotFile {
 }
 
 impl DecodedSnapshotFile {
+    pub fn slot(&self) -> Slot {
+        self.bank.slot
+    }
+
+    pub fn bank_hash(&self) -> Hash {
+        self.bank.hash
+    }
+
+    pub fn accounts_lt_hash(&self) -> &AccountsLtHash {
+        &self.bank.accounts_lt_hash
+    }
+
+    pub fn capitalization(&self) -> u64 {
+        self.bank.capitalization
+    }
+
+    pub fn accounts_data_len(&self) -> u64 {
+        self.bank.accounts_data_len
+    }
+
     pub fn bank_fields(&self) -> &BankFieldsToDeserialize {
         &self.bank
     }

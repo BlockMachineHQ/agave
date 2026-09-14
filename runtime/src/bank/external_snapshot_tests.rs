@@ -172,8 +172,11 @@ fn public_snapshot_decoder_preserves_native_fields_and_inventory() {
         let bytes = fixture.incremental.as_ref().unwrap_or(&fixture.full);
         let decoded =
             serde_snapshot::decode_snapshot_file(&mut BufReader::new(Cursor::new(bytes))).unwrap();
-        assert_eq!(decoded.bank_fields().slot, fixture.bank.slot());
-        assert_eq!(decoded.bank_fields().hash, fixture.bank.hash());
+        assert_eq!(decoded.slot(), fixture.bank.slot());
+        assert_eq!(decoded.bank_hash(), fixture.bank.hash());
+        assert_eq!(decoded.accounts_lt_hash(), &fixture.image.accounts_lt_hash);
+        assert_eq!(decoded.capitalization(), fixture.image.capitalization);
+        assert_eq!(decoded.accounts_data_len(), fixture.image.accounts_data_len);
         assert_eq!(decoded.accounts_slot(), fixture.bank.slot());
         let mut actual: Vec<_> = decoded.storage_entries().collect();
         let base = incremental.then_some(fixture.manifest.full.0);
