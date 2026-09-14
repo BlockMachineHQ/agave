@@ -549,7 +549,10 @@ pub struct BankFieldsToDeserialize {
     pub(crate) accounts_data_len: u64,
     pub(crate) accounts_lt_hash: AccountsLtHash,
     pub(crate) bank_hash_stats: BankHashStats,
-    pub(crate) block_id: Option<Hash>, // Option wrapper can be removed in version after v4.1
+    /// Native snapshot block identity, also consumed by `Bank::new_from_snapshot`.
+    /// The optional value preserves pre-v4.1 snapshot compatibility; consumers
+    /// must not substitute a bank hash or fabricate an absent block ID.
+    pub block_id: Option<Hash>, // Option wrapper can be removed in version after v4.1
 }
 
 /// Bank's common fields shared by all supported snapshot versions for serialization.
