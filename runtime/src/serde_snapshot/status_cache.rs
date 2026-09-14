@@ -81,36 +81,43 @@ pub fn deserialize_status_cache(
     status_cache_path: &Path,
 ) -> agave_snapshots::Result<Vec<BankSlotDelta>> {
     snapshot_utils::deserialize_snapshot_data_file(status_cache_path, |stream| {
-        let snapshot_slot_deltas: Vec<SerdeBankSlotDelta> =
-            serde_snapshot::deserialize_wincode_from(stream)?;
-
-        let slot_deltas = snapshot_slot_deltas
-            .into_iter()
-            .map(|slot_delta| {
-                let status_map = slot_delta
-                    .2
-                    .into_iter()
-                    .map(|(key, value)| {
-                        (
-                            key,
-                            (
-                                value.0,
-                                value
-                                    .1
-                                    .into_iter()
-                                    .map(|(key_slice, result)| {
-                                        (key_slice, result.map_err(TransactionError::from))
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ),
-                        )
-                    })
-                    .collect::<ahash::HashMap<_, _>>();
-                (slot_delta.0, slot_delta.1, Arc::new(Mutex::new(status_map)))
-            })
-            .collect::<Vec<_>>();
-        Ok(slot_deltas)
+        deserialize_status_cache_from(stream)
     })
+}
+
+/// Shared native wire decoder for file and external-image restore callers.
+pub(super) fn deserialize_status_cache_from<'a>(
+    stream: impl wincode::io::Reader<'a>,
+) -> agave_snapshots::Result<Vec<BankSlotDelta>> {
+    let snapshot_slot_deltas: Vec<SerdeBankSlotDelta> =
+        serde_snapshot::deserialize_wincode_from(stream)?;
+
+    let slot_deltas = snapshot_slot_deltas
+        .into_iter()
+        .map(|slot_delta| {
+            let status_map = slot_delta
+                .2
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        (
+                            value.0,
+                            value
+                                .1
+                                .into_iter()
+                                .map(|(key_slice, result)| {
+                                    (key_slice, result.map_err(TransactionError::from))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+                .collect::<ahash::HashMap<_, _>>();
+            (slot_delta.0, slot_delta.1, Arc::new(Mutex::new(status_map)))
+        })
+        .collect::<Vec<_>>();
+    Ok(slot_deltas)
 }
 
 /// Copy of `TransactionError` that uses a different `InstructionError` type to

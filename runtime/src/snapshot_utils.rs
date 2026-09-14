@@ -52,7 +52,7 @@ use {
         cmp::Ordering,
         collections::{HashMap, HashSet},
         fs,
-        io::{self, BufReader, Error as IoError, Read, Seek, Write},
+        io::{self, BufReader, Error as IoError, Read, Seek, SeekFrom, Write},
         mem,
         num::NonZeroUsize,
         path::{Path, PathBuf},
@@ -891,13 +891,12 @@ fn deserialize_snapshot_data_files_capped<T: Sized>(
     maximum_file_size: u64,
     deserializer: impl FnOnce(&mut SnapshotStreams<std::fs::File>) -> Result<T>,
 ) -> Result<T> {
-    let (full_snapshot_file_size, mut full_snapshot_data_file_stream) =
-        create_snapshot_data_file_stream(
-            &snapshot_root_paths.full_snapshot_root_file_path,
-            maximum_file_size,
-        )?;
+    let (_, mut full_snapshot_data_file_stream) = create_snapshot_data_file_stream(
+        &snapshot_root_paths.full_snapshot_root_file_path,
+        maximum_file_size,
+    )?;
 
-    let (incremental_snapshot_file_size, mut incremental_snapshot_data_file_stream) =
+    let (_, mut incremental_snapshot_data_file_stream) =
         if let Some(ref incremental_snapshot_root_file_path) =
             snapshot_root_paths.incremental_snapshot_root_file_path
         {
@@ -914,22 +913,47 @@ fn deserialize_snapshot_data_files_capped<T: Sized>(
         full_snapshot_stream: &mut full_snapshot_data_file_stream,
         incremental_snapshot_stream: incremental_snapshot_data_file_stream.as_mut(),
     };
-    let ret = deserializer(&mut snapshot_streams)?;
+    deserialize_snapshot_streams_capped(&mut snapshot_streams, maximum_file_size, deserializer)
+}
 
-    check_deserialize_file_consumed(
-        full_snapshot_file_size,
-        &snapshot_root_paths.full_snapshot_root_file_path,
-        &mut full_snapshot_data_file_stream,
-    )?;
+/// Complete native snapshot-file boundary, shared by file restore and external
+/// image attachment. Size checks apply to each entire file, not separately to
+/// the sequential bincode values. The decoder retains its native EOF semantics;
+/// consumption is checked only after the whole decoder returns successfully.
+pub(crate) fn deserialize_snapshot_streams_capped<R: Read + Seek, T>(
+    streams: &mut SnapshotStreams<R>,
+    maximum_file_size: u64,
+    deserializer: impl FnOnce(&mut SnapshotStreams<R>) -> Result<T>,
+) -> Result<T> {
+    fn file_size<R: Read + Seek>(stream: &mut BufReader<R>, maximum: u64) -> Result<u64> {
+        let start = stream.stream_position()?;
+        let size = stream.seek(SeekFrom::End(0))?;
+        stream.seek(SeekFrom::Start(start))?;
+        if size > maximum {
+            return Err(IoError::other(format!(
+                "too large snapshot data file to deserialize: {size} bytes (max size is {maximum} bytes)",
+            )).into());
+        }
+        if start != 0 {
+            return Err(IoError::other(
+                "invalid snapshot data file: reader must start at byte zero",
+            )
+            .into());
+        }
+        Ok(size)
+    }
+    let full_size = file_size(streams.full_snapshot_stream, maximum_file_size)?;
+    let incremental_size = streams
+        .incremental_snapshot_stream
+        .as_mut()
+        .map(|stream| file_size(stream, maximum_file_size))
+        .transpose()?;
+    let ret = deserializer(streams)?;
 
-    if let Some(ref incremental_snapshot_root_file_path) =
-        snapshot_root_paths.incremental_snapshot_root_file_path
-    {
-        check_deserialize_file_consumed(
-            incremental_snapshot_file_size.unwrap(),
-            incremental_snapshot_root_file_path,
-            incremental_snapshot_data_file_stream.as_mut().unwrap(),
-        )?;
+    check_deserialize_file_consumed(full_size, "full snapshot", streams.full_snapshot_stream)?;
+
+    if let Some(stream) = streams.incremental_snapshot_stream.as_mut() {
+        check_deserialize_file_consumed(incremental_size.unwrap(), "incremental snapshot", stream)?;
     }
 
     Ok(ret)
@@ -961,10 +985,10 @@ fn create_snapshot_data_file_stream(
 
 /// After running the deserializer function, perform common checks to ensure the snapshot archive
 /// files were consumed correctly.
-fn check_deserialize_file_consumed(
+fn check_deserialize_file_consumed<R: Read + Seek>(
     file_size: u64,
     file_path: impl AsRef<Path>,
-    file_stream: &mut BufReader<std::fs::File>,
+    file_stream: &mut BufReader<R>,
 ) -> Result<()> {
     let consumed_size = file_stream.stream_position()?;
 

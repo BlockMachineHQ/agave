@@ -9,6 +9,9 @@ use {
         accounts_index::IndexKey,
         accounts_scan::{ScanConfig, ScanError, ScanResult},
         ancestors::Ancestors,
+        external_backend::{
+            BankIdentity, ExternalAccountBackend, NativeAccountsDb, terminal_backend_result,
+        },
         is_loadable::IsLoadable as _,
         storable_accounts::StorableAccounts,
     },
@@ -63,7 +66,9 @@ impl<'a, T: SVMMessage> TransactionAccountLocksIterator<'a, T> {
 #[derive(Debug)]
 pub struct Accounts {
     /// Single global AccountsDb
-    pub accounts_db: Arc<AccountsDb>,
+    pub accounts_db: NativeAccountsDb,
+    external_backend: Option<Arc<dyn ExternalAccountBackend>>,
+    stake_account_stores_per_block: u64,
 
     /// set of read-only and writable accounts which are currently
     /// being processed by banking/replay threads
@@ -78,8 +83,86 @@ pub enum AccountAddressFilter {
 impl Accounts {
     pub fn new(accounts_db: Arc<AccountsDb>) -> Self {
         Self {
-            accounts_db,
+            stake_account_stores_per_block: accounts_db
+                .partitioned_epoch_rewards_config
+                .stake_account_stores_per_block,
+            accounts_db: NativeAccountsDb(Some(accounts_db)),
+            external_backend: None,
             account_locks: Mutex::new(AccountLocks::default()),
+        }
+    }
+
+    pub fn new_external(
+        backend: Arc<dyn ExternalAccountBackend>,
+        stake_account_stores_per_block: u64,
+    ) -> Self {
+        Self {
+            accounts_db: NativeAccountsDb(None),
+            external_backend: Some(backend),
+            stake_account_stores_per_block,
+            account_locks: Mutex::new(AccountLocks::default()),
+        }
+    }
+
+    /// Raw trusted-provider access for the native framework. Public because Bank
+    /// and BankForks live in a separate crate; this is not a consumer mutation API.
+    /// Callers MUST obey the [`ExternalAccountBackend`] protocol contract, including
+    /// when retaining a clone. Readers should use Bank's frozen account pin.
+    pub fn external_backend(&self) -> Option<&Arc<dyn ExternalAccountBackend>> {
+        self.external_backend.as_ref()
+    }
+
+    pub fn stake_account_stores_per_block(&self) -> u64 {
+        self.stake_account_stores_per_block
+    }
+
+    pub fn new_child(&self, parent: BankIdentity, child: BankIdentity) -> Self {
+        if let Some(backend) = &self.external_backend {
+            assert_eq!(backend.identity(), parent);
+            let child_backend = terminal_backend_result(backend.fork_child(child));
+            assert_eq!(child_backend.identity(), child);
+            assert_eq!(child_backend.parent_identity(), Some(parent));
+            Self::new_external(child_backend, self.stake_account_stores_per_block)
+        } else {
+            Self::new(Arc::clone(&self.accounts_db))
+        }
+    }
+
+    pub fn has_accounts_update_notifier(&self) -> bool {
+        self.external_backend.is_none() && self.accounts_db.has_accounts_update_notifier()
+    }
+
+    pub fn record_stakes_cache_store_time(&self, us: u64) {
+        if self.external_backend.is_none() {
+            self.accounts_db
+                .stats
+                .stakes_cache_check_and_store_us
+                .fetch_add(us, Ordering::Relaxed);
+        }
+    }
+
+    pub fn mark_slot_frozen(&self, slot: Slot) {
+        if let Some(backend) = &self.external_backend {
+            assert_eq!(backend.identity().slot, slot);
+            terminal_backend_result(backend.seal());
+        } else {
+            self.accounts_db.mark_slot_frozen(slot);
+        }
+    }
+
+    fn load_backend(
+        &self,
+        ancestors: &Ancestors,
+        pubkey: &Pubkey,
+        hint: LoadHint,
+        cache: PopulateReadCache,
+    ) -> Option<(AccountSharedData, Slot)> {
+        if let Some(backend) = &self.external_backend {
+            assert_eq!(ancestors.max_slot(), backend.identity().slot);
+            terminal_backend_result(backend.load(pubkey))
+                .filter(|(account, _)| account.lamports() != 0)
+        } else {
+            self.accounts_db.load(ancestors, pubkey, hint, cache)
         }
     }
 
@@ -166,7 +249,7 @@ impl Accounts {
         ancestors: &Ancestors,
         pubkey: &Pubkey,
     ) -> Option<(AccountSharedData, Slot)> {
-        self.accounts_db.load(
+        self.load_backend(
             ancestors,
             pubkey,
             LoadHint::FixedMaxRoot,
@@ -181,7 +264,7 @@ impl Accounts {
         ancestors: &Ancestors,
         pubkey: &Pubkey,
     ) -> Option<(AccountSharedData, Slot)> {
-        self.accounts_db.load(
+        self.load_backend(
             ancestors,
             pubkey,
             LoadHint::FixedMaxRoot,
@@ -194,7 +277,7 @@ impl Accounts {
         ancestors: &Ancestors,
         pubkey: &Pubkey,
     ) -> Option<(AccountSharedData, Slot)> {
-        self.accounts_db.load(
+        self.load_backend(
             ancestors,
             pubkey,
             LoadHint::Unspecified,
@@ -540,6 +623,20 @@ impl Accounts {
         update_index_thread_selection: UpdateIndexThreadSelection,
         ancestors: &Ancestors,
     ) {
+        if let Some(backend) = &self.external_backend {
+            assert_eq!(accounts.target_slot(), backend.identity().slot);
+            assert_eq!(ancestors.max_slot(), backend.identity().slot);
+            let ordered = (0..accounts.len())
+                .map(|index| {
+                    (
+                        *accounts.pubkey(index),
+                        accounts.account(index, |account| account.take_account()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            terminal_backend_result(backend.store(&ordered));
+            return;
+        }
         let accounts_db = &self.accounts_db;
         if accounts_db.has_accounts_update_notifier() {
             let mut current_write_version = accounts_db
@@ -567,7 +664,16 @@ impl Accounts {
 
     /// Add a slot to root.  Root slots cannot be purged
     pub fn add_root(&self, slot: Slot) -> AccountsAddRootTiming {
-        self.accounts_db.add_root(slot)
+        if let Some(backend) = &self.external_backend {
+            assert_eq!(backend.identity().slot, slot);
+            terminal_backend_result(backend.mark_root());
+            AccountsAddRootTiming {
+                index_us: 0,
+                cache_us: 0,
+            }
+        } else {
+            self.accounts_db.add_root(slot)
+        }
     }
 }
 

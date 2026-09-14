@@ -221,17 +221,11 @@ pub fn bank_from_snapshot_archives(
     measure_rebuild.stop();
     info!("{measure_rebuild}");
 
-    if bank.capitalization() != info.calculated_capitalization {
-        // When limit_load_slot_count is set, ignore capitalization mismatches.
-        // Because skipped slots may have changed the calculated capitalization,
-        // causing a mismatch with the bank's capitalization.
-        if limit_load_slot_count_from_snapshot.is_none() {
-            return Err(SnapshotError::MismatchedCapitalization(
-                bank.capitalization(),
-                info.calculated_capitalization,
-            ));
-        }
-    }
+    verify_snapshot_capitalization(
+        &bank,
+        info.calculated_capitalization,
+        limit_load_slot_count_from_snapshot.is_some(),
+    )?;
 
     verify_epoch_stakes(&bank)?;
 
@@ -248,9 +242,7 @@ pub fn bank_from_snapshot_archives(
     );
     let slot_deltas = serde_snapshot::deserialize_status_cache(&status_cache_path)?;
 
-    verify_slot_deltas(slot_deltas.as_slice(), &bank)?;
-
-    bank.status_cache.write().unwrap().append(&slot_deltas);
+    restore_snapshot_status_cache(&bank, &slot_deltas)?;
 
     let snapshot_archive_info = incremental_snapshot_archive_info.map_or_else(
         || full_snapshot_archive_info.snapshot_archive_info(),
@@ -292,6 +284,35 @@ pub fn bank_from_snapshot_archives(
         ("verify_bank_us", measure_verify.as_us(), i64),
     );
     Ok(bank)
+}
+
+pub(crate) fn verify_snapshot_capitalization(
+    bank: &Bank,
+    calculated_capitalization: u64,
+    allow_partial: bool,
+) -> agave_snapshots::Result<()> {
+    if bank.capitalization() != calculated_capitalization {
+        // When limit_load_slot_count is set, ignore capitalization mismatches.
+        // Because skipped slots may have changed the calculated capitalization,
+        // causing a mismatch with the bank's capitalization.
+        if !allow_partial {
+            return Err(SnapshotError::MismatchedCapitalization(
+                bank.capitalization(),
+                calculated_capitalization,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn restore_snapshot_status_cache(
+    bank: &Bank,
+    slot_deltas: &[BankSlotDelta],
+) -> agave_snapshots::Result<()> {
+    verify_slot_deltas(slot_deltas, bank)?;
+    bank.status_cache.write().unwrap().append(slot_deltas);
+    Ok(())
 }
 
 /// Rebuild bank from snapshot archives
@@ -420,17 +441,11 @@ pub fn bank_from_snapshot_dir(
     );
     info!("{measure_rebuild_bank}");
 
-    if bank.capitalization() != info.calculated_capitalization {
-        // When limit_load_slot_count is set, ignore capitalization mismatches.
-        // Because skipped slots may have changed the calculated capitalization,
-        // causing a mismatch with the bank's capitalization.
-        if limit_load_slot_count_from_snapshot.is_none() {
-            return Err(SnapshotError::MismatchedCapitalization(
-                bank.capitalization(),
-                info.calculated_capitalization,
-            ));
-        }
-    }
+    verify_snapshot_capitalization(
+        &bank,
+        info.calculated_capitalization,
+        limit_load_slot_count_from_snapshot.is_some(),
+    )?;
 
     verify_epoch_stakes(&bank)?;
 
@@ -443,9 +458,7 @@ pub fn bank_from_snapshot_dir(
     );
     let slot_deltas = serde_snapshot::deserialize_status_cache(&status_cache_path)?;
 
-    verify_slot_deltas(slot_deltas.as_slice(), &bank)?;
-
-    bank.status_cache.write().unwrap().append(&slot_deltas);
+    restore_snapshot_status_cache(&bank, &slot_deltas)?;
 
     if !bank.verify_snapshot_bank(
         true,
@@ -466,7 +479,7 @@ pub fn bank_from_snapshot_dir(
 }
 
 /// Verifies the snapshot's slot and hash matches the bank's
-fn verify_bank_against_expected_slot_hash(
+pub(crate) fn verify_bank_against_expected_slot_hash(
     bank: &Bank,
     snapshot_slot: Slot,
     snapshot_hash: SnapshotHash,
@@ -519,16 +532,21 @@ fn snapshot_version_and_root_paths(
 }
 
 /// Verify that the snapshot's slot deltas are not corrupt/invalid
-fn verify_slot_deltas(
-    slot_deltas: &[BankSlotDelta],
-    bank: &Bank,
-) -> std::result::Result<(), VerifySlotDeltasError> {
+fn verify_slot_deltas(slot_deltas: &[BankSlotDelta], bank: &Bank) -> agave_snapshots::Result<()> {
     let max_root_entries = bank.status_cache.read().unwrap().max_root_entries();
     let info = verify_slot_deltas_structural(slot_deltas, bank.slot(), max_root_entries)?;
-    let slot_history = bank
-        .get_slot_history()
-        .expect("snapshot bank must have slot history");
-    verify_slot_deltas_with_history(&info.slots, &slot_history, bank.slot(), max_root_entries)
+    let slot_history = bank.get_slot_history().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot must contain well-formed slot history",
+        )
+    })?;
+    Ok(verify_slot_deltas_with_history(
+        &info.slots,
+        &slot_history,
+        bank.slot(),
+        max_root_entries,
+    )?)
 }
 
 /// Verify that the snapshot's slot deltas are not corrupt/invalid
@@ -639,7 +657,7 @@ fn verify_slot_history(
 }
 
 /// Verifies the bank's epoch stakes are valid after rebuilding from a snapshot
-fn verify_epoch_stakes(bank: &Bank) -> std::result::Result<(), VerifyEpochStakesError> {
+pub(crate) fn verify_epoch_stakes(bank: &Bank) -> std::result::Result<(), VerifyEpochStakesError> {
     // Stakes are required for epochs from the current epoch up-to-and-including the
     // leader schedule epoch.  In practice this will only be two epochs: the current and the next.
     // Using a range mirrors how Bank::new_from_genesis() seeds the initial epoch stakes.

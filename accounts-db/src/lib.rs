@@ -24,6 +24,7 @@ pub mod append_vec;
 mod append_vec;
 pub mod blockhash_queue;
 pub mod contains;
+pub mod external_backend;
 pub mod is_loadable;
 mod is_zero_lamport;
 mod obsolete_accounts;

@@ -236,6 +236,10 @@ pub mod bank_hash_details;
 pub mod builtins;
 mod check_transactions;
 pub mod entry_bytes_budget;
+#[cfg(test)]
+mod external_backend_tests;
+#[cfg(test)]
+mod external_snapshot_tests;
 mod fee_distribution;
 mod metrics;
 pub(crate) mod partitioned_epoch_rewards;
@@ -814,6 +818,44 @@ struct HashOverride {
     bank_hash: Hash,
 }
 
+/// Read-only handle to an external storage view obtained from a frozen Bank.
+/// Retains the provider view after Bank drop; visibility and invalidation follow
+/// the provider's pinned-view contract. This is not a clean-checkpoint receipt or
+/// isolation from trusted code retaining a raw provider handle.
+///
+/// No mutation/lifecycle methods or raw-handle conversion are exposed.
+/// ```compile_fail
+/// use solana_runtime::bank::FrozenExternalAccountPin;
+/// fn mutate(pin: &FrozenExternalAccountPin) {
+///     pin.store(&[]).unwrap();
+/// }
+/// ```
+/// ```compile_fail
+/// use solana_runtime::bank::FrozenExternalAccountPin;
+/// fn root(pin: &FrozenExternalAccountPin) {
+///     pin.apply_root(&[pin.identity()]).unwrap();
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct FrozenExternalAccountPin {
+    backend: Arc<dyn solana_accounts_db::external_backend::ExternalAccountBackend>,
+}
+
+impl FrozenExternalAccountPin {
+    pub fn identity(&self) -> solana_accounts_db::external_backend::BankIdentity {
+        self.backend.identity()
+    }
+
+    /// Returns absence/tombstones as None and preserves provider errors as Err.
+    pub fn load(
+        &self,
+        key: &Pubkey,
+    ) -> solana_accounts_db::external_backend::BackendResult<Option<(AccountSharedData, Slot)>>
+    {
+        self.backend.load(key)
+    }
+}
+
 /// Manager for the state of all accounts and programs after processing its entries.
 pub struct Bank {
     /// References to accounts, parent and signature status
@@ -1165,10 +1207,8 @@ fn create_stake_history_account(
 
 impl Bank {
     fn default_with_accounts(accounts: Accounts) -> Self {
-        let partitioned_rewards_stake_account_stores_per_block = accounts
-            .accounts_db
-            .partitioned_epoch_rewards_config
-            .stake_account_stores_per_block;
+        let partitioned_rewards_stake_account_stores_per_block =
+            accounts.stake_account_stores_per_block();
         let mut bank = Self {
             rc: BankRc::new(accounts),
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
@@ -1245,7 +1285,9 @@ impl Bank {
         bank.transaction_processor =
             TransactionBatchProcessor::new_uninitialized(bank.slot, bank.epoch);
 
-        bank.accounts_data_size_initial = bank.calculate_accounts_data_size().unwrap();
+        if bank.rc.accounts.external_backend().is_none() {
+            bank.accounts_data_size_initial = bank.calculate_accounts_data_size().unwrap();
+        }
 
         bank
     }
@@ -1258,15 +1300,10 @@ impl Bank {
         debug_keys: Option<Arc<HashSet<Pubkey>>>,
         accounts_db_config: AccountsDbConfig,
         accounts_update_notifier: Option<AccountsUpdateNotifier>,
-        #[cfg_attr(not(feature = "dev-context-only-utils"), expect(unused))]
         leader_for_tests: Option<SlotLeader>,
         exit: Arc<AtomicBool>,
-        #[cfg_attr(not(feature = "dev-context-only-utils"), expect(unused))] genesis_hash: Option<
-            Hash,
-        >,
-        #[cfg_attr(not(feature = "dev-context-only-utils"), expect(unused))] feature_set: Option<
-            FeatureSet,
-        >,
+        genesis_hash: Option<Hash>,
+        feature_set: Option<FeatureSet>,
     ) -> Self {
         // Initialize the rewards thread pool while creating the first bank so
         // the first epoch boundary crossing does not pay the cost.
@@ -1274,6 +1311,68 @@ impl Bank {
         let accounts_db =
             AccountsDb::new_with_config(paths, accounts_db_config, accounts_update_notifier, exit);
         let accounts = Accounts::new(Arc::new(accounts_db));
+        Self::new_from_genesis_accounts(
+            genesis_config,
+            runtime_config,
+            debug_keys,
+            accounts,
+            leader_for_tests,
+            genesis_hash,
+            feature_set,
+        )
+    }
+
+    /// Construct a native Bank by executing native genesis initialization into
+    /// an injected, empty (slot 0, bank ID 0) view. Full snapshot restore is not
+    /// supported by this constructor.
+    /// The injected provider is trusted. Retaining a clone does not authorize
+    /// direct mutation/rooting outside the native Bank/BankForks protocol; see
+    /// [`solana_accounts_db::external_backend::ExternalAccountBackend`].
+    pub fn new_from_genesis_with_external_backend(
+        genesis_config: &GenesisConfig,
+        runtime_config: Arc<RuntimeConfig>,
+        backend: Arc<dyn solana_accounts_db::external_backend::ExternalAccountBackend>,
+        partitioned_rewards_config: solana_accounts_db::partitioned_rewards::PartitionedEpochRewardsConfig,
+    ) -> Self {
+        use solana_accounts_db::external_backend::{BankIdentity, terminal_backend_result};
+        assert_eq!(
+            backend.identity(),
+            BankIdentity {
+                slot: 0,
+                bank_id: 0
+            }
+        );
+        assert_eq!(backend.parent_identity(), None);
+        terminal_backend_result(backend.initialize_empty_genesis());
+        let _rewards_calculation_thread_pool = rewards_calculation_thread_pool();
+        Self::new_from_genesis_accounts(
+            genesis_config,
+            runtime_config,
+            None,
+            Accounts::new_external(
+                backend,
+                partitioned_rewards_config.stake_account_stores_per_block,
+            ),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn new_from_genesis_accounts(
+        genesis_config: &GenesisConfig,
+        runtime_config: Arc<RuntimeConfig>,
+        debug_keys: Option<Arc<HashSet<Pubkey>>>,
+        accounts: Accounts,
+        #[cfg_attr(not(feature = "dev-context-only-utils"), expect(unused))]
+        leader_for_tests: Option<SlotLeader>,
+        #[cfg_attr(not(feature = "dev-context-only-utils"), expect(unused))] genesis_hash: Option<
+            Hash,
+        >,
+        #[cfg_attr(not(feature = "dev-context-only-utils"), expect(unused))] feature_set: Option<
+            FeatureSet,
+        >,
+    ) -> Self {
         let mut bank = Self::default_with_accounts(accounts);
         bank.ancestors = Ancestors::from(vec![bank.slot()]);
         bank.compute_budget = runtime_config.compute_budget;
@@ -1376,10 +1475,17 @@ impl Bank {
         let epoch_schedule = parent.epoch_schedule().clone();
         let epoch = epoch_schedule.get_epoch(slot);
 
+        let bank_id = parent.rc.bank_id_generator.fetch_add(1, Relaxed) + 1;
         let (rc, bank_rc_creation_time_us) = measure_us!({
-            let accounts_db = Arc::clone(&parent.rc.accounts.accounts_db);
+            use solana_accounts_db::external_backend::BankIdentity;
             BankRc {
-                accounts: Arc::new(Accounts::new(accounts_db)),
+                accounts: Arc::new(parent.rc.accounts.new_child(
+                    BankIdentity {
+                        slot: parent.slot(),
+                        bank_id: parent.bank_id(),
+                    },
+                    BankIdentity { slot, bank_id },
+                )),
                 parent: RwLock::new(Some(Arc::clone(&parent))),
                 bank_id_generator: Arc::clone(&parent.rc.bank_id_generator),
             }
@@ -1391,7 +1497,6 @@ impl Bank {
             FeeRateGovernor::new_derived(&parent.fee_rate_governor, parent.signature_count())
         );
 
-        let bank_id = rc.bank_id_generator.fetch_add(1, Relaxed) + 1;
         let (blockhash_queue, blockhash_queue_time_us) =
             measure_us!(RwLock::new(parent.blockhash_queue.read().unwrap().clone()));
 
@@ -1920,18 +2025,28 @@ impl Bank {
         new
     }
 
+    #[cfg(feature = "dev-context-only-utils")]
     fn load_rent_from_account_for_snapshot_load(
         accounts: &Accounts,
         ancestors: &Ancestors,
     ) -> Rent {
+        Self::try_load_rent_from_snapshot(accounts, ancestors).expect("snapshot rent sysvar")
+    }
+
+    fn try_load_rent_from_snapshot(
+        accounts: &Accounts,
+        ancestors: &Ancestors,
+    ) -> std::result::Result<Rent, crate::serde_snapshot::ExternalSnapshotError> {
+        use crate::serde_snapshot::ExternalSnapshotError::Invalid;
         // The serialized rent collector is deprecated. Instead, reconstruct from fields plus
         // the rent sysvar account state.
         let rent_sysvar = accounts
             .load_with_fixed_root_do_not_populate_read_cache(ancestors, &sysvar::rent::id())
-            .expect("snapshot must contain rent sysvar account")
+            .ok_or(Invalid("snapshot must contain rent sysvar account"))?
             .0;
-        from_account::<sysvar::rent::Rent, _>(&rent_sysvar)
-            .expect("snapshot must contain well-formed rent sysvar account")
+        from_account::<sysvar::rent::Rent, _>(&rent_sysvar).ok_or(Invalid(
+            "snapshot must contain well-formed rent sysvar account",
+        ))
     }
 
     /// Complete bank initialization for block execution. Performs epoch
@@ -2004,6 +2119,7 @@ impl Bank {
     }
 
     /// Create a bank from explicit arguments and deserialized fields from snapshot
+    #[cfg(test)]
     pub(crate) fn new_from_snapshot(
         bank_rc: BankRc,
         genesis_config: &GenesisConfig,
@@ -2014,6 +2130,44 @@ impl Bank {
         accounts_data_size_initial: u64,
         epoch_stakes: HashMap<Epoch, VersionedEpochStakes>,
     ) -> Self {
+        Self::try_new_from_snapshot(
+            bank_rc,
+            genesis_config,
+            runtime_config,
+            fields,
+            leader_for_tests,
+            debug_keys,
+            accounts_data_size_initial,
+            epoch_stakes,
+        )
+        .expect("native snapshot reconstruction")
+    }
+
+    /// Shared completion for native AccountsDb and verified external images.
+    pub(crate) fn try_new_from_snapshot(
+        bank_rc: BankRc,
+        genesis_config: &GenesisConfig,
+        runtime_config: Arc<RuntimeConfig>,
+        fields: BankFieldsToDeserialize,
+        leader_for_tests: Option<SlotLeader>,
+        debug_keys: Option<Arc<HashSet<Pubkey>>>,
+        accounts_data_size_initial: u64,
+        epoch_stakes: HashMap<Epoch, VersionedEpochStakes>,
+    ) -> std::result::Result<Self, crate::serde_snapshot::ExternalSnapshotError> {
+        use crate::serde_snapshot::ExternalSnapshotError::Invalid;
+        if fields.genesis_creation_time != genesis_config.creation_time
+            || fields.ticks_per_slot != genesis_config.ticks_per_slot
+            || fields
+                .slot
+                .checked_add(1)
+                .and_then(|slot| slot.checked_mul(fields.ticks_per_slot))
+                != Some(fields.max_tick_height)
+            || fields.epoch_schedule != genesis_config.epoch_schedule
+        {
+            return Err(Invalid(
+                "snapshot fields do not match genesis configuration",
+            ));
+        }
         let now = Instant::now();
         let slot = fields.slot;
         let epoch = fields.epoch_schedule.get_epoch(slot);
@@ -2038,31 +2192,25 @@ impl Bank {
                     .load_with_fixed_root_do_not_populate_read_cache(&ancestors, pubkey)?;
                 Some(account)
             })
-            .expect(
-                "Stakes cache is inconsistent with accounts-db. This can indicate a corrupted \
-                 snapshot or bugs in cached accounts or accounts-db.",
-            )
+            .map_err(
+                |error| crate::serde_snapshot::ExternalSnapshotError::Stakes(format!("{error:?}"))
+            )?
         );
         info!("Loading Stakes took: {stakes_time}");
-        assert!(
-            fields.versioned_epoch_stakes.is_empty(),
-            "should be already converted and passed in epoch_stakes parameter"
-        );
-        assert!(
-            !epoch_stakes.is_empty(),
-            "should be populated (from fields.versioned_epoch_stakes)"
-        );
+        if !fields.versioned_epoch_stakes.is_empty() || epoch_stakes.is_empty() {
+            return Err(Invalid("snapshot epoch stakes were not reconstructed"));
+        }
 
         // Compute and validate the slot leader from epoch stakes.
         let compute_leader = || {
             if slot == 0 {
                 // Genesis snapshot has no leader for the genesis block.
                 // Instead the leader is set to the maximum delegated vote account.
-                stakes
-                    .highest_staked_node()
-                    .expect("genesis snapshot should contain at least one staked vote account")
+                stakes.highest_staked_node().ok_or(Invalid(
+                    "genesis snapshot should contain at least one staked vote account",
+                ))
             } else {
-                Self::slot_leader_from_epoch_stakes(
+                Self::try_slot_leader_from_epoch_stakes(
                     fields.slot,
                     &fields.epoch_schedule,
                     &epoch_stakes,
@@ -2072,22 +2220,23 @@ impl Bank {
         #[cfg(not(feature = "dev-context-only-utils"))]
         let leader = {
             _ = leader_for_tests;
-            compute_leader()
+            compute_leader()?
         };
         #[cfg(feature = "dev-context-only-utils")]
-        let leader = leader_for_tests.unwrap_or_else(compute_leader);
-        assert_eq!(
-            fields.leader_id, leader.id,
-            "snapshot leader_id does not match computed slot leader"
-        );
+        let leader = match leader_for_tests {
+            Some(leader) => leader,
+            None => compute_leader()?,
+        };
+        if fields.leader_id != leader.id {
+            return Err(Invalid(
+                "snapshot leader_id does not match computed slot leader",
+            ));
+        }
 
         let stakes_accounts_load_duration = now.elapsed();
-        let rent = Self::load_rent_from_account_for_snapshot_load(&bank_rc.accounts, &ancestors);
-        let partitioned_rewards_stake_account_stores_per_block = bank_rc
-            .accounts
-            .accounts_db
-            .partitioned_epoch_rewards_config
-            .stake_account_stores_per_block;
+        let rent = Self::try_load_rent_from_snapshot(&bank_rc.accounts, &ancestors)?;
+        let partitioned_rewards_stake_account_stores_per_block =
+            bank_rc.accounts.stake_account_stores_per_block();
         let mut bank = Self {
             rc: bank_rc,
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
@@ -2171,21 +2320,8 @@ impl Bank {
             bank.set_is_alpenglow();
         }
 
-        // Sanity assertions between bank snapshot and genesis config
-        // Consider removing from serializable bank state
-        // (BankFieldsToSerialize/BankFieldsToDeserialize) and initializing
-        // from the passed in genesis_config instead (as new()/new_from_genesis() already do)
-        assert_eq!(
-            bank.genesis_creation_time, genesis_config.creation_time,
-            "Bank snapshot genesis creation time does not match genesis.bin creation time. The \
-             snapshot and genesis.bin might pertain to different clusters"
-        );
-        assert_eq!(bank.ticks_per_slot, genesis_config.ticks_per_slot);
-        assert_eq!(bank.max_tick_height, (bank.slot + 1) * bank.ticks_per_slot);
-        assert_eq!(bank.epoch_schedule, genesis_config.epoch_schedule);
-
         bank.refresh_slot_params_from_snapshot(genesis_config);
-        bank.initialize_after_snapshot_restore(|| rewards_calculation_thread_pool);
+        bank.try_initialize_after_snapshot_restore(|| rewards_calculation_thread_pool)?;
 
         datapoint_info!(
             "bank-new-from-fields",
@@ -2205,25 +2341,38 @@ impl Bank {
                 i64
             ),
         );
-        bank
+        Ok(bank)
     }
 
     /// Compute the slot leader from epoch stakes during snapshot restoration.
+    #[cfg(feature = "dev-context-only-utils")]
     fn slot_leader_from_epoch_stakes(
         slot: Slot,
         epoch_schedule: &EpochSchedule,
         epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
     ) -> SlotLeader {
+        Self::try_slot_leader_from_epoch_stakes(slot, epoch_schedule, epoch_stakes)
+            .expect("snapshot slot leader")
+    }
+
+    fn try_slot_leader_from_epoch_stakes(
+        slot: Slot,
+        epoch_schedule: &EpochSchedule,
+        epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
+    ) -> std::result::Result<SlotLeader, crate::serde_snapshot::ExternalSnapshotError> {
+        use crate::serde_snapshot::ExternalSnapshotError::Invalid;
         let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(slot);
         let epoch_vote_accounts = epoch_stakes
             .get(&epoch)
-            .expect("epoch stakes should contain current epoch")
+            .ok_or(Invalid("epoch stakes should contain current epoch"))?
             .stakes()
             .vote_accounts();
         let leader_schedule =
             leader_schedule_from_vote_accounts(epoch, epoch_schedule, epoch_vote_accounts.as_ref())
-                .expect("leader schedule should be computable from epoch stakes");
-        leader_schedule.get_slot_leader_at_index(slot_index as usize)
+                .ok_or(Invalid(
+                    "leader schedule should be computable from epoch stakes",
+                ))?;
+        Ok(leader_schedule.get_slot_leader_at_index(slot_index as usize))
     }
 
     /// Return subset of bank fields representing serializable state
@@ -3039,8 +3188,33 @@ impl Bank {
             // that rehash() can be called and *not* modify self.accounts_lt_hash.
             self.finish_accounts_lt_hash_updates();
             *hash = self.hash_internal_state();
-            self.rc.accounts.accounts_db.mark_slot_frozen(self.slot());
+            self.rc.accounts.mark_slot_frozen(self.slot());
         }
+    }
+
+    /// Read-only pin to this Bank's sealed external account view. Returns None
+    /// for native AccountsDb; panics for an external Bank that is not frozen.
+    /// Obtaining a pin does not freeze or root the Bank.
+    pub fn frozen_external_account_pin(&self) -> Option<FrozenExternalAccountPin> {
+        self.frozen_external_account_backend()
+            .map(|backend| FrozenExternalAccountPin { backend })
+    }
+
+    /// Raw sealed provider handle retained for native-framework/provider-test
+    /// compatibility. Consumers should use [`Self::frozen_external_account_pin`].
+    /// This handle is trusted, not a sandbox: mutations MUST go through native
+    /// Bank methods and rooting through BankForks. Calling provider callbacks
+    /// directly bypasses those protocol guarantees, even though the Bank is frozen.
+    pub fn frozen_external_account_backend(
+        &self,
+    ) -> Option<Arc<dyn solana_accounts_db::external_backend::ExternalAccountBackend>> {
+        self.rc.accounts.external_backend().map(|backend| {
+            assert!(
+                self.is_frozen(),
+                "external root access requires a frozen Bank"
+            );
+            Arc::clone(backend)
+        })
     }
 
     /// Freeze the bank and verify its computed bank hash against the expected bank hash,
@@ -3097,7 +3271,17 @@ impl Bank {
         let mut squash_accounts_time = Measure::start("squash_accounts_time");
         for slot in roots.iter().rev() {
             // root forks cannot be purged
-            let add_root_timing = self.rc.accounts.add_root(*slot);
+            let add_root_timing =
+                if self.rc.accounts.external_backend().is_some() && *slot != self.slot() {
+                    self.parents_iter()
+                        .find(|parent| parent.slot() == *slot)
+                        .expect("root must be an exact ancestor")
+                        .rc
+                        .accounts
+                        .add_root(*slot)
+                } else {
+                    self.rc.accounts.add_root(*slot)
+                };
             total_index_us += add_root_timing.index_us;
             total_cache_us += add_root_timing.cache_us;
         }
@@ -3941,7 +4125,16 @@ impl Bank {
     }
 
     pub fn remove_unrooted_slots(&self, slots: &[(Slot, BankId)]) {
-        self.rc.accounts.accounts_db.remove_unrooted_slots(slots)
+        if let Some(backend) = self.rc.accounts.external_backend() {
+            use solana_accounts_db::external_backend::{BankIdentity, terminal_backend_result};
+            let banks = slots
+                .iter()
+                .map(|&(slot, bank_id)| BankIdentity { slot, bank_id })
+                .collect::<Vec<_>>();
+            terminal_backend_result(backend.remove_unrooted(&banks));
+        } else {
+            self.rc.accounts.accounts_db.remove_unrooted_slots(slots)
+        }
     }
 
     pub fn get_hash_age(&self, hash: &Hash) -> Option<u64> {
@@ -4310,11 +4503,8 @@ impl Bank {
             // If geyser is present, we must collect `SanitizedTransaction`
             // references in order to comply with that interface - until it
             // is changed.
-            let maybe_transaction_refs = self
-                .accounts()
-                .accounts_db
-                .has_accounts_update_notifier()
-                .then(|| {
+            let maybe_transaction_refs =
+                self.accounts().has_accounts_update_notifier().then(|| {
                     sanitized_txs
                         .iter()
                         .map(|tx| tx.as_sanitized_transaction())
@@ -4725,12 +4915,7 @@ impl Bank {
         });
         self.store_accounts_without_stakes_cache(accounts, thread_pool_for_loading_accounts);
         m.stop();
-        self.rc
-            .accounts
-            .accounts_db
-            .stats
-            .stakes_cache_check_and_store_us
-            .fetch_add(m.as_us(), Relaxed);
+        self.rc.accounts.record_stakes_cache_store_time(m.as_us());
     }
 
     fn store_account_without_stakes_cache(&self, pubkey: &Pubkey, account: &AccountSharedData) {
@@ -4848,36 +5033,30 @@ impl Bank {
     }
 
     /// Verifies bank fields are consistent with current slot params.
+    #[cfg(test)]
     fn assert_bank_matches_slot_params(&self) {
+        self.verify_bank_matches_slot_params()
+            .expect("snapshot slot params");
+    }
+
+    fn verify_bank_matches_slot_params(
+        &self,
+    ) -> std::result::Result<(), crate::serde_snapshot::ExternalSnapshotError> {
         let params = self.current_slot_params();
-        assert_eq!(
-            self.ns_per_slot,
-            params.ns_per_slot(),
-            "snapshot slot-time ns_per_slot mismatch"
-        );
-        assert_eq!(
-            self.slots_per_year.to_bits(),
-            params.slots_per_year().to_bits(),
-            "snapshot slot-time slots_per_year mismatch"
-        );
-        assert_eq!(
-            self.rent_collector.slots_per_year.to_bits(),
-            params.slots_per_year().to_bits(),
-            "snapshot slot-time rent_collector.slots_per_year mismatch"
-        );
         let hashes_per_tick = self.hashes_per_tick();
-        if !self.feature_set.is_active(&feature_set::alpenglow::id()) && hashes_per_tick.is_some() {
-            assert_eq!(
-                hashes_per_tick,
-                params.hashes_per_tick(),
-                "snapshot slot-time hashes_per_tick mismatch"
-            );
+        if self.ns_per_slot != params.ns_per_slot()
+            || self.slots_per_year.to_bits() != params.slots_per_year().to_bits()
+            || self.rent_collector.slots_per_year.to_bits() != params.slots_per_year().to_bits()
+            || (!self.feature_set.is_active(&feature_set::alpenglow::id())
+                && hashes_per_tick.is_some()
+                && hashes_per_tick != params.hashes_per_tick())
+            || self.entry_bytes_budget().slot_limit() != params.max_entry_bytes_per_slot()
+        {
+            return Err(crate::serde_snapshot::ExternalSnapshotError::Invalid(
+                "snapshot slot-time parameters mismatch",
+            ));
         }
-        assert_eq!(
-            self.entry_bytes_budget().slot_limit(),
-            params.max_entry_bytes_per_slot(),
-            "snapshot slot-time entry byte budget mismatch"
-        );
+        Ok(())
     }
 
     /// Applies slot-time changes for runtime-only fields. This function is
@@ -5383,7 +5562,10 @@ impl Bank {
     ///
     /// Only intended to be called at startup, or from tests/ledger-tool.
     #[must_use]
-    fn verify_accounts(&self, calculated_accounts_lt_hash: Option<&AccountsLtHash>) -> bool {
+    pub(crate) fn verify_accounts(
+        &self,
+        calculated_accounts_lt_hash: Option<&AccountsLtHash>,
+    ) -> bool {
         let accounts_db = &self.rc.accounts.accounts_db;
 
         fn check_lt_hash(
@@ -5429,7 +5611,7 @@ impl Bank {
     }
 
     #[must_use]
-    fn verify_hash(&self) -> bool {
+    pub(crate) fn verify_hash(&self) -> bool {
         assert!(self.is_frozen());
         let calculated_hash = self.hash_internal_state();
         let expected_hash = self.hash();
@@ -6013,7 +6195,20 @@ impl Bank {
 
     /// Compute and apply all activated features, initialize the transaction
     /// processor, and recalculate partitioned rewards if needed
+    #[cfg(test)]
     fn initialize_after_snapshot_restore<F, TP>(&mut self, rewards_thread_pool_builder: F)
+    where
+        F: FnOnce() -> TP,
+        TP: std::borrow::Borrow<ThreadPool>,
+    {
+        self.try_initialize_after_snapshot_restore(rewards_thread_pool_builder)
+            .expect("snapshot initialization");
+    }
+
+    fn try_initialize_after_snapshot_restore<F, TP>(
+        &mut self,
+        rewards_thread_pool_builder: F,
+    ) -> std::result::Result<(), crate::serde_snapshot::ExternalSnapshotError>
     where
         F: FnOnce() -> TP,
         TP: std::borrow::Borrow<ThreadPool>,
@@ -6025,7 +6220,7 @@ impl Bank {
                 .set_execution_cost(compute_budget.to_cost());
         }
 
-        self.compute_and_apply_features_after_snapshot_restore();
+        self.try_compute_and_apply_features_after_snapshot_restore()?;
         self.stakes_cache.refresh_delegated_stakes(
             self.new_warmup_cooldown_rate_epoch(),
             self.use_fixed_point_stake_math(),
@@ -6035,6 +6230,7 @@ impl Bank {
 
         self.transaction_processor
             .fill_missing_sysvar_cache_entries(self);
+        Ok(())
     }
 
     /// Compute and apply all activated features and also add accounts for builtins
@@ -6061,13 +6257,21 @@ impl Bank {
 
     /// Compute and apply all activated features but do not add built-in
     /// accounts because we shouldn't modify accounts db for a completed bank
+    #[cfg(test)]
     fn compute_and_apply_features_after_snapshot_restore(&mut self) {
+        self.try_compute_and_apply_features_after_snapshot_restore()
+            .expect("snapshot features");
+    }
+
+    fn try_compute_and_apply_features_after_snapshot_restore(
+        &mut self,
+    ) -> std::result::Result<(), crate::serde_snapshot::ExternalSnapshotError> {
         // Update the feature set to include all features active at this slot
         let feature_set = self.compute_active_feature_set(false).0;
         self.feature_set = Arc::new(feature_set);
 
         self.apply_activated_features();
-        self.assert_bank_matches_slot_params();
+        self.verify_bank_matches_slot_params()
     }
 
     /// This is called from each epoch boundary
@@ -7094,12 +7298,15 @@ impl Drop for Bank {
     fn drop(&mut self) {
         if let Some(drop_callback) = self.drop_callback.read().unwrap().0.as_ref() {
             drop_callback.callback(self);
-        } else {
+        } else if self.rc.accounts.external_backend().is_none() {
             // Default case for tests
             self.rc
                 .accounts
                 .accounts_db
                 .purge_slot(self.slot(), self.bank_id(), false);
+        }
+        if let Some(backend) = self.rc.accounts.external_backend() {
+            solana_accounts_db::external_backend::terminal_backend_result(backend.release_bank());
         }
     }
 }

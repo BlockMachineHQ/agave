@@ -12,6 +12,7 @@ use {
     agave_votor_messages::migration::MigrationStatus,
     arc_swap::ArcSwap,
     log::*,
+    solana_accounts_db::external_backend::{BackendResult, BankIdentity, terminal_backend_result},
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
     solana_measure::measure::Measure,
@@ -98,6 +99,33 @@ impl BankForks {
     pub fn new_rw_arc(root_bank: Bank) -> Arc<RwLock<Self>> {
         let root_bank = Arc::new(root_bank);
         let root_slot = root_bank.slot();
+
+        if let Some(backend) = root_bank.rc.accounts.external_backend() {
+            // Genesis initialization is complete. Establish receipts before the
+            // first squash and before any reader can observe this initial root.
+            if root_slot == 0 {
+                if root_bank.parent().is_some()
+                    || backend.parent_identity().is_some()
+                    || backend.identity()
+                        != (BankIdentity {
+                            slot: 0,
+                            bank_id: root_bank.bank_id(),
+                        })
+                {
+                    terminal_backend_result::<()>(Err("malformed external genesis root".into()));
+                }
+                root_bank.freeze();
+            }
+            terminal_backend_result(Self::apply_external_root(&root_bank, None, false));
+            root_bank.squash();
+        } else if root_bank
+            .parents_iter()
+            .any(|bank| bank.rc.accounts.external_backend().is_some())
+        {
+            terminal_backend_result::<()>(
+                Err("mixed native/external initial root ancestry".into()),
+            );
+        }
 
         let mut banks = HashMap::new();
         banks.insert(
@@ -444,6 +472,67 @@ impl BankForks {
         }
     }
 
+    /// Validate without changing any Bank/root/status state, then wait for the
+    /// selected backend's storage barrier. All set_root callers share this path.
+    pub(crate) fn apply_external_root(
+        target: &Arc<Bank>,
+        previous: Option<&Arc<Bank>>,
+        has_snapshot_controller: bool,
+    ) -> BackendResult<()> {
+        let mut banks = target.parents();
+        banks.reverse();
+        banks.push(target.clone());
+        let external = banks
+            .iter()
+            .any(|bank| bank.rc.accounts.external_backend().is_some())
+            || previous.is_some_and(|bank| bank.rc.accounts.external_backend().is_some());
+        if !external {
+            return Ok(());
+        }
+        if has_snapshot_controller {
+            return Err("snapshot controller is unsupported for external roots".into());
+        }
+        let identity = |bank: &Bank| BankIdentity {
+            slot: bank.slot(),
+            bank_id: bank.bank_id(),
+        };
+        if let Some(previous) = previous
+            && (target.slot() < previous.slot()
+                || !banks.iter().any(|bank| Arc::ptr_eq(bank, previous)))
+        {
+            return Err("external root must be the current root or its exact descendant".into());
+        }
+        let mut path = Vec::with_capacity(banks.len());
+        for bank in &banks {
+            if !bank.is_frozen() {
+                return Err("external root path requires frozen Banks".into());
+            }
+            let backend = bank
+                .rc
+                .accounts
+                .external_backend()
+                .ok_or("mixed native/external root ancestry")?;
+            let id = identity(bank);
+            if backend.identity() != id {
+                return Err("external root Bank identity mismatch".into());
+            }
+            if let Some(parent) = path.last() {
+                if backend.parent_identity() != Some(*parent) || id.slot <= parent.slot {
+                    return Err("external root parent identity mismatch".into());
+                }
+            } else if bank.slot() == 0 && backend.parent_identity().is_some() {
+                return Err("external genesis has a parent".into());
+            }
+            path.push(id);
+        }
+        target
+            .rc
+            .accounts
+            .external_backend()
+            .ok_or("mixed native/external root target")?
+            .apply_root(&path)
+    }
+
     fn do_set_root_return_metrics(
         &mut self,
         root: Slot,
@@ -452,9 +541,20 @@ impl BankForks {
     ) -> (Vec<BankWithScheduler>, SetRootMetrics) {
         let old_epoch = self.sharable_banks.root().epoch();
 
-        let root_bank = &self
-            .get(root)
-            .expect("root bank didn't exist in bank_forks");
+        let root_bank = &self.get(root).unwrap_or_else(|| {
+            if self.root_bank().rc.accounts.external_backend().is_some() {
+                return terminal_backend_result(Err(
+                    "external root bank didn't exist in bank_forks".into(),
+                ));
+            }
+            panic!("root bank didn't exist in bank_forks");
+        });
+
+        terminal_backend_result(Self::apply_external_root(
+            root_bank,
+            Some(&self.root_bank()),
+            snapshot_controller.is_some(),
+        ));
 
         self.root = root;
         self.sharable_banks.root_bank.store(Arc::clone(root_bank));

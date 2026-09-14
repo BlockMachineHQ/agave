@@ -62,6 +62,7 @@ use {
     },
 };
 
+mod external_snapshot;
 mod obsolete_accounts;
 mod status_cache;
 mod storage;
@@ -69,6 +70,9 @@ mod storages_list;
 mod tests;
 mod types;
 mod utils;
+pub use external_snapshot::{
+    ExternalSnapshotError, SnapshotManifest, bank_from_snapshot_streams_with_external_backend,
+};
 
 pub(crate) use {
     obsolete_accounts::{SerdeObsoleteAccounts, SerdeObsoleteAccountsMap},
@@ -488,7 +492,11 @@ where
         .clone_with_lamports_per_signature(lamports_per_signature);
     bank_fields.versioned_epoch_stakes = versioned_epoch_stakes;
     bank_fields.accounts_lt_hash = accounts_lt_hash
-        .expect("snapshot must have accounts_lt_hash")
+        .ok_or_else(|| {
+            Box::new(bincode::ErrorKind::Custom(
+                "snapshot must have accounts_lt_hash".into(),
+            ))
+        })?
         .into();
     bank_fields.block_id = block_id;
 
@@ -507,7 +515,6 @@ pub(crate) fn fields_from_stream<R: Read>(
     deserialize_bank_fields(snapshot_stream)
 }
 
-#[cfg(feature = "dev-context-only-utils")]
 pub(crate) fn fields_from_streams(
     snapshot_streams: &mut SnapshotStreams<impl Read>,
 ) -> std::result::Result<
@@ -791,6 +798,15 @@ pub(crate) struct ReconstructedBankInfo {
     pub(crate) calculated_capitalization: u64,
 }
 
+fn reconstruct_epoch_stakes(
+    stakes: Vec<(Epoch, DeserializableVersionedEpochStakes)>,
+) -> HashMap<Epoch, VersionedEpochStakes> {
+    stakes
+        .into_iter()
+        .map(|(epoch, stakes)| (epoch, stakes.into()))
+        .collect()
+}
+
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_bank_from_fields<E>(
     bank_fields: SnapshotBankFields,
@@ -812,12 +828,7 @@ pub(crate) fn reconstruct_bank_from_fields<E>(
     let deserializable_epoch_stakes = std::mem::take(&mut bank_fields.versioned_epoch_stakes);
     let epoch_stakes_handle = thread::Builder::new()
         .name("solRctEpochStk".into())
-        .spawn(|| {
-            deserializable_epoch_stakes
-                .into_iter()
-                .map(|(epoch, stakes)| (epoch, stakes.into()))
-                .collect()
-        })?;
+        .spawn(|| reconstruct_epoch_stakes(deserializable_epoch_stakes))?;
     let (accounts_db, reconstructed_accounts_db_info) = reconstruct_accountsdb_from_fields(
         snapshot_accounts_db_fields,
         account_paths,
@@ -834,7 +845,7 @@ pub(crate) fn reconstruct_bank_from_fields<E>(
     let runtime_config = Arc::new(runtime_config.clone());
     let epoch_stakes = epoch_stakes_handle.join().expect("calculate epoch stakes");
 
-    let bank = Bank::new_from_snapshot(
+    let bank = Bank::try_new_from_snapshot(
         bank_rc,
         genesis_config,
         runtime_config,
@@ -843,7 +854,8 @@ pub(crate) fn reconstruct_bank_from_fields<E>(
         debug_keys,
         reconstructed_accounts_db_info.accounts_data_len,
         epoch_stakes,
-    );
+    )
+    .map_err(|error| Box::new(bincode::ErrorKind::Custom(error.to_string())))?;
 
     Ok((
         bank,
