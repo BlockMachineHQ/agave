@@ -140,7 +140,9 @@ pub fn bank_from_snapshot_streams_with_external_backend<R: Read + Seek>(
     {
         return Err(Invalid("snapshot backend must have BankId 0 and no parent"));
     }
-    let epoch_stakes = reconstruct_epoch_stakes(std::mem::take(&mut fields.versioned_epoch_stakes));
+    let epoch_stakes = DecodedSnapshotFile::reconstruct_epoch_stakes(std::mem::take(
+        &mut fields.versioned_epoch_stakes,
+    ));
     terminal_backend_result(backend.initialize_verified_snapshot(image));
     let bank = Bank::try_new_from_snapshot(
         BankRc::new(Accounts::new_external(

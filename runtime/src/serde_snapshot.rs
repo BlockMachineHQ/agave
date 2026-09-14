@@ -511,6 +511,30 @@ pub struct DecodedSnapshotFile {
 }
 
 impl DecodedSnapshotFile {
+    pub fn epoch_schedule(&self) -> &EpochSchedule {
+        &self.bank.epoch_schedule
+    }
+
+    pub fn hard_forks(&self) -> &HardForks {
+        &self.bank.hard_forks
+    }
+
+    /// Reconstruct the serialized epoch stakes through the native restore path.
+    /// This borrowed view clones the intermediate data; production restore moves
+    /// that data into the same reconstruction method on its existing worker.
+    pub fn epoch_stakes(&self) -> HashMap<Epoch, VersionedEpochStakes> {
+        Self::reconstruct_epoch_stakes(self.bank.versioned_epoch_stakes.clone())
+    }
+
+    fn reconstruct_epoch_stakes(
+        stakes: Vec<(Epoch, DeserializableVersionedEpochStakes)>,
+    ) -> HashMap<Epoch, VersionedEpochStakes> {
+        stakes
+            .into_iter()
+            .map(|(epoch, stakes)| (epoch, stakes.into()))
+            .collect()
+    }
+
     pub fn slot(&self) -> Slot {
         self.bank.slot
     }
@@ -875,15 +899,6 @@ pub(crate) struct ReconstructedBankInfo {
     pub(crate) calculated_capitalization: u64,
 }
 
-fn reconstruct_epoch_stakes(
-    stakes: Vec<(Epoch, DeserializableVersionedEpochStakes)>,
-) -> HashMap<Epoch, VersionedEpochStakes> {
-    stakes
-        .into_iter()
-        .map(|(epoch, stakes)| (epoch, stakes.into()))
-        .collect()
-}
-
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_bank_from_fields<E>(
     bank_fields: SnapshotBankFields,
@@ -905,7 +920,7 @@ pub(crate) fn reconstruct_bank_from_fields<E>(
     let deserializable_epoch_stakes = std::mem::take(&mut bank_fields.versioned_epoch_stakes);
     let epoch_stakes_handle = thread::Builder::new()
         .name("solRctEpochStk".into())
-        .spawn(|| reconstruct_epoch_stakes(deserializable_epoch_stakes))?;
+        .spawn(|| DecodedSnapshotFile::reconstruct_epoch_stakes(deserializable_epoch_stakes))?;
     let (accounts_db, reconstructed_accounts_db_info) = reconstruct_accountsdb_from_fields(
         snapshot_accounts_db_fields,
         account_paths,

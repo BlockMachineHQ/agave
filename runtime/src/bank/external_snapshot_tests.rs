@@ -178,6 +178,29 @@ fn public_snapshot_decoder_preserves_native_fields_and_inventory() {
         assert_eq!(decoded.capitalization(), fixture.image.capitalization);
         assert_eq!(decoded.accounts_data_len(), fixture.image.accounts_data_len);
         assert_eq!(decoded.accounts_slot(), fixture.bank.slot());
+        assert_eq!(decoded.epoch_schedule(), fixture.bank.epoch_schedule());
+        assert_eq!(
+            decoded.hard_forks(),
+            &*fixture.bank.hard_forks.read().unwrap()
+        );
+        let stakes = decoded.epoch_stakes();
+        assert!(!stakes.is_empty());
+        assert_eq!(stakes.len(), fixture.bank.epoch_stakes_map().len());
+        for (epoch, actual) in &stakes {
+            let expected = fixture.bank.epoch_stakes(*epoch).unwrap();
+            assert_eq!(actual.total_stake(), expected.total_stake());
+            assert_eq!(
+                actual.node_id_to_vote_accounts(),
+                expected.node_id_to_vote_accounts()
+            );
+            assert_eq!(
+                actual.epoch_authorized_voters(),
+                expected.epoch_authorized_voters()
+            );
+            let actual_votes = actual.stakes().vote_accounts();
+            let expected_votes = expected.stakes().vote_accounts();
+            assert_eq!(actual_votes.as_ref(), expected_votes.as_ref());
+        }
         let mut actual: Vec<_> = decoded.storage_entries().collect();
         let base = incremental.then_some(fixture.manifest.full.0);
         let mut expected: Vec<_> = fixture
