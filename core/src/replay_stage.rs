@@ -4838,7 +4838,7 @@ impl ReplayStage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn mark_slots_duplicate_confirmed(
+    pub fn mark_slots_duplicate_confirmed(
         confirmed_slots: &[(Slot, Hash)],
         blockstore: &Blockstore,
         bank_forks: &RwLock<BankForks>,
@@ -4890,7 +4890,7 @@ impl ReplayStage {
         }
     }
 
-    fn tower_duplicate_confirmed_forks(
+    pub fn tower_duplicate_confirmed_forks(
         tower: &Tower,
         voted_stakes: &VotedStakes,
         total_stake: Stake,
