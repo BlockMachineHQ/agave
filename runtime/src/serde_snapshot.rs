@@ -503,6 +503,62 @@ where
     Ok((bank_fields, accounts_db_fields))
 }
 
+/// Decoded native Bank file and its serialized account-storage inventory.
+/// This does not verify an archive identity or authenticate any account bytes.
+pub struct DecodedSnapshotFile {
+    bank: BankFieldsToDeserialize,
+    accounts: AccountsDbFields<SerializableAccountStorageEntry>,
+}
+
+impl DecodedSnapshotFile {
+    pub fn bank_fields(&self) -> &BankFieldsToDeserialize {
+        &self.bank
+    }
+
+    pub fn accounts_slot(&self) -> Slot {
+        self.accounts.2
+    }
+
+    /// Serialized (modification slot, storage id, current byte length), in native
+    /// wire order. No paths, sorting, deduplication or replacement ids are invented.
+    pub fn storage_entries(&self) -> impl Iterator<Item = (Slot, usize, usize)> + '_ {
+        self.accounts.0.iter().flat_map(|(slot, entries)| {
+            entries.iter().map(move |entry| {
+                let (id, len) = entry.identity_and_len();
+                (*slot, id, len)
+            })
+        })
+    }
+
+    pub fn into_bank_fields(self) -> BankFieldsToDeserialize {
+        self.bank
+    }
+}
+
+fn decode_snapshot_fields<R: Read>(
+    stream: &mut BufReader<R>,
+) -> Result<DecodedSnapshotFile, Error> {
+    let (bank, accounts) = deserialize_bank_fields(stream)?;
+    Ok(DecodedSnapshotFile { bank, accounts })
+}
+
+/// Decode a complete V1_2_0 Bank file using the production field decoder and
+/// native complete-file size/consumption checks. The reader must start at zero.
+/// Archive acquisition must separately bind the inventory to actual account files
+/// and validate full/incremental pairing. This constructs no Bank or AccountsDb.
+pub fn decode_snapshot_file<R: Read + std::io::Seek>(
+    stream: &mut BufReader<R>,
+) -> agave_snapshots::Result<DecodedSnapshotFile> {
+    crate::snapshot_utils::deserialize_snapshot_streams_capped(
+        &mut SnapshotStreams {
+            full_snapshot_stream: stream,
+            incremental_snapshot_stream: None,
+        },
+        crate::snapshot_utils::MAX_SNAPSHOT_DATA_FILE_SIZE,
+        |streams| decode_snapshot_fields(streams.full_snapshot_stream).map_err(SnapshotError::from),
+    )
+}
+
 pub(crate) fn fields_from_stream<R: Read>(
     snapshot_stream: &mut BufReader<R>,
 ) -> std::result::Result<
@@ -512,7 +568,8 @@ pub(crate) fn fields_from_stream<R: Read>(
     ),
     Error,
 > {
-    deserialize_bank_fields(snapshot_stream)
+    let decoded = decode_snapshot_fields(snapshot_stream)?;
+    Ok((decoded.bank, decoded.accounts))
 }
 
 pub(crate) fn fields_from_streams(

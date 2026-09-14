@@ -165,6 +165,53 @@ fn serialize(bank: &Bank, base: Option<Slot>) -> Vec<u8> {
     serialize_with(bank, base, |_| {})
 }
 
+#[test]
+fn public_snapshot_decoder_preserves_native_fields_and_inventory() {
+    for incremental in [false, true] {
+        let fixture = fixture(incremental);
+        let bytes = fixture.incremental.as_ref().unwrap_or(&fixture.full);
+        let decoded =
+            serde_snapshot::decode_snapshot_file(&mut BufReader::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(decoded.bank_fields().slot, fixture.bank.slot());
+        assert_eq!(decoded.bank_fields().hash, fixture.bank.hash());
+        assert_eq!(decoded.accounts_slot(), fixture.bank.slot());
+        let mut actual: Vec<_> = decoded.storage_entries().collect();
+        let base = incremental.then_some(fixture.manifest.full.0);
+        let mut expected: Vec<_> = fixture
+            .bank
+            .get_snapshot_storages(base)
+            .iter()
+            .map(|storage| {
+                (
+                    storage.slot(),
+                    storage.id() as usize,
+                    storage.accounts.len() - storage.get_obsolete_bytes(Some(fixture.bank.slot())),
+                )
+            })
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            decoded.into_bank_fields().accounts_lt_hash,
+            fixture.image.accounts_lt_hash
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(
+            serde_snapshot::decode_snapshot_file(&mut BufReader::new(Cursor::new(trailing)))
+                .is_err()
+        );
+        assert!(
+            serde_snapshot::decode_snapshot_file(&mut BufReader::new(Cursor::new(
+                &bytes[..bytes.len() / 2]
+            )))
+            .is_err()
+        );
+    }
+}
+
 fn serialize_with(
     bank: &Bank,
     base: Option<Slot>,

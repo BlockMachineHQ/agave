@@ -23,6 +23,10 @@ pub struct SerializableAccountStorageEntry {
 }
 
 impl SerializableAccountStorageEntry {
+    pub(super) fn identity_and_len(&self) -> (usize, usize) {
+        (self.id, self.accounts_current_len)
+    }
+
     /// Creates a new SerializableAccountStorageEntry from the current
     /// AccountStorageEntry and a given snapshot slot. When obsolete accounts
     /// are enabled, the saved size is decreased by the amount of obsolete bytes
