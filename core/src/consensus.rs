@@ -155,7 +155,7 @@ impl SwitchForkDecision {
 
 const VOTE_THRESHOLD_DEPTH_SHALLOW: usize = 4;
 pub const VOTE_THRESHOLD_DEPTH: usize = 8;
-pub const SWITCH_FORK_THRESHOLD: f64 = 0.38;
+pub use solana_runtime::consensus::confirmation::SWITCH_FORK_THRESHOLD;
 
 pub type Result<T> = std::result::Result<T, TowerError>;
 
@@ -163,7 +163,7 @@ pub type Stake = u64;
 pub type VotedStakes = HashMap<Slot, Stake, ahash::RandomState>;
 pub type PubkeyVotes = Vec<(Pubkey, Slot)>;
 
-pub(crate) struct ComputedBankState {
+pub struct ComputedBankState {
     pub voted_stakes: VotedStakes,
     pub total_stake: Stake,
     pub fork_stake: Stake,
@@ -312,6 +312,12 @@ impl From<Tower1_7_14> for Tower {
 }
 
 impl Tower {
+    /// Native local vote state for commitment aggregation. This does not grant
+    /// mutation authority or imply that the local vote was transmitted/landed.
+    pub fn vote_state(&self) -> &TowerVoteState {
+        &self.vote_state
+    }
+
     pub fn new(
         node_pubkey: &Pubkey,
         vote_account_pubkey: &Pubkey,

@@ -3,7 +3,6 @@ use {
         banking_trace::BankingPacketSender,
         consensus::vote_stake_tracker::VoteStakeTracker,
         optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
-        replay_stage::DUPLICATE_THRESHOLD,
         result::{Error, Result},
         sigverify_stage::GossipSigVerifyHandle,
     },
@@ -28,7 +27,7 @@ use {
     solana_runtime::{
         bank::Bank,
         bank_forks::{BankForks, SharableBanks},
-        commitment::VOTE_THRESHOLD_SIZE,
+        consensus::confirmation::SlotConfirmationTracker,
         epoch_stakes::VersionedEpochStakes,
         vote_sender_types::{ReplayVoteMessage, ReplayVoteReceiver},
     },
@@ -61,21 +60,19 @@ pub type GossipVerifiedVoteHashReceiver = Receiver<(Pubkey, Slot, Hash)>;
 pub type DuplicateConfirmedSlotsSender = Sender<ThresholdConfirmedSlots>;
 pub type DuplicateConfirmedSlotsReceiver = Receiver<ThresholdConfirmedSlots>;
 
-const THRESHOLDS_TO_CHECK: [f64; 2] = [DUPLICATE_THRESHOLD, VOTE_THRESHOLD_SIZE];
 const MAX_VOTE_SLOT_DISTANCE_FROM_ROOT: Slot = 50_000;
-const MAX_VOTE_HASHES_PER_PUBKEY_PER_SLOT: u8 = 2;
 
 /// Notification channels and context threaded through the vote confirmation
 /// pipeline. Groups the senders used to communicate threshold crossings
 /// (duplicate confirmation, optimistic confirmation, gossip verified votes,
 /// etc.) together with the migration status that gates some notifications.
-struct ConfirmationNotifiers {
-    gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
-    verified_voter_slots_sender: VerifiedVoterSlotsSender,
-    rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
-    bank_notification_sender: Option<BankNotificationSenderConfig>,
-    duplicate_confirmed_slot_sender: Option<DuplicateConfirmedSlotsSender>,
-    migration_status: Arc<MigrationStatus>,
+pub struct ConfirmationNotifiers {
+    pub gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
+    pub verified_voter_slots_sender: VerifiedVoterSlotsSender,
+    pub rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
+    pub bank_notification_sender: Option<BankNotificationSenderConfig>,
+    pub duplicate_confirmed_slot_sender: Option<DuplicateConfirmedSlotsSender>,
+    pub migration_status: Arc<MigrationStatus>,
 }
 
 #[derive(Default)]
@@ -84,8 +81,7 @@ pub struct SlotVoteTracker {
     // to whether or not we've seen the vote on gossip.
     // True if seen on gossip, false if only seen in replay.
     voted: HashMap<Pubkey, bool>,
-    optimistic_votes_tracker: HashMap<Hash, VoteStakeTracker>,
-    num_optimistic_vote_hashes: HashMap<Pubkey, u8>,
+    confirmations: SlotConfirmationTracker,
     voted_slot_updates: Option<Vec<Pubkey>>,
     gossip_only_stake: u64,
 }
@@ -102,25 +98,11 @@ impl SlotVoteTracker {
         stake: u64,
         total_epoch_stake: u64,
     ) -> (Vec<bool>, bool) {
-        let num_vote_hashes = self.num_optimistic_vote_hashes.entry(pubkey).or_default();
-        if *num_vote_hashes >= MAX_VOTE_HASHES_PER_PUBKEY_PER_SLOT {
-            return (vec![false; THRESHOLDS_TO_CHECK.len()], false);
-        }
-
-        let result @ (_, is_new) = self
-            .optimistic_votes_tracker
-            .entry(hash)
-            .or_default()
-            .add_vote_pubkey(pubkey, stake, total_epoch_stake, &THRESHOLDS_TO_CHECK);
-
-        if is_new {
-            *num_vote_hashes += 1;
-        }
-
-        result
+        self.confirmations
+            .add_vote(hash, pubkey, stake, total_epoch_stake)
     }
     pub(crate) fn optimistic_votes_tracker(&self, hash: &Hash) -> Option<&VoteStakeTracker> {
-        self.optimistic_votes_tracker.get(hash)
+        self.confirmations.votes(hash)
     }
 }
 
@@ -139,7 +121,7 @@ impl VoteTracker {
         slot_vote_trackers.entry(slot).or_default().clone()
     }
 
-    pub(crate) fn get_slot_vote_tracker(&self, slot: Slot) -> Option<Arc<RwLock<SlotVoteTracker>>> {
+    pub fn get_slot_vote_tracker(&self, slot: Slot) -> Option<Arc<RwLock<SlotVoteTracker>>> {
         self.slot_vote_trackers.read().unwrap().get(&slot).cloned()
     }
 
@@ -168,13 +150,13 @@ impl VoteTracker {
             .retain(|slot, _| *slot >= new_root);
     }
 
-    fn progress_with_new_root_bank(&self, root_bank: &Bank) {
+    pub fn progress_with_new_root_bank(&self, root_bank: &Bank) {
         self.purge_stale_state(root_bank);
     }
 }
 
 #[derive(Default)]
-struct VoteProcessingTiming {
+pub struct VoteProcessingTiming {
     gossip_txn_processing_time_us: u64,
     gossip_slot_confirming_time_us: u64,
     last_report: AtomicInterval,
@@ -283,18 +265,21 @@ impl BankVoteBuffer {
     }
 }
 
-struct VoteBuffer {
+/// Production replay vote correlation by native BankId and message hash.
+/// Consumers must process native invalid/completed notifications in order and
+/// keep draining during scheduler teardown. This buffer supplies no RAM bound.
+pub struct VoteBuffer {
     bank_votes: HashMap<BankId, BankVoteBuffer>,
 }
 
 impl VoteBuffer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             bank_votes: HashMap::new(),
         }
     }
 
-    fn receive_and_collect_ready_votes(
+    pub fn receive_and_collect_ready_votes(
         &mut self,
         replay_votes: impl Iterator<Item = ReplayVoteMessage>,
     ) -> Vec<ParsedVote> {
@@ -428,8 +413,14 @@ impl VoteBuffer {
         }
     }
 
-    fn prune_stale_slots(&mut self, root_slot: Slot) {
+    pub fn prune_stale_slots(&mut self, root_slot: Slot) {
         self.bank_votes.retain(|_, state| state.slot() > root_slot);
+    }
+}
+
+impl Default for VoteBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -503,7 +494,7 @@ impl ClusterInfoVoteListener {
         }
     }
 
-    pub(crate) fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.thread_hdls.into_iter().try_for_each(JoinHandle::join)
     }
 
@@ -577,7 +568,10 @@ impl ClusterInfoVoteListener {
         ))
     }
 
-    fn filter_verified_votes(
+    /// Apply the production authorized-voter filter after packet signature
+    /// verification. Packet/transaction pairing must be the original verified
+    /// pairing; a clear discard flag alone is not signature verification.
+    pub fn filter_verified_votes(
         votes: Vec<Transaction>,
         packet_batches: Vec<PacketBatch>,
         sharable_banks: &SharableBanks,
@@ -894,7 +888,12 @@ impl ClusterInfoVoteListener {
         }
     }
 
-    fn filter_and_confirm_with_new_votes(
+    /// Synchronous production confirmation intake. Gossip inputs must already
+    /// pass signature and authorized-voter verification; replay inputs must be
+    /// released by the native VoteBuffer. Preserve the latest-vote map across
+    /// calls and process root retirement in the production order. Notification
+    /// consumers must drain concurrently if supplied channels are bounded.
+    pub fn filter_and_confirm_with_new_votes(
         vote_tracker: &VoteTracker,
         gossip_vote_txs: Vec<Transaction>,
         replayed_votes: Vec<ParsedVote>,

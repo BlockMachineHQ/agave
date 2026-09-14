@@ -12,7 +12,8 @@ use {
     solana_rpc::rpc_subscriptions::RpcSubscriptions,
     solana_runtime::{
         bank::Bank,
-        commitment::{BlockCommitment, BlockCommitmentCache, CommitmentSlots, VOTE_THRESHOLD_SIZE},
+        commitment::{BlockCommitment, BlockCommitmentCache, CommitmentSlots},
+        consensus::commitment::calculate_commitment_cache,
     },
     std::{
         cmp::max,
@@ -51,17 +52,8 @@ impl TowerCommitmentAggregationData {
     }
 }
 
-fn get_highest_super_majority_root(mut rooted_stake: Vec<(Slot, u64)>, total_stake: u64) -> Slot {
-    rooted_stake.sort_by(|a, b| a.0.cmp(&b.0).reverse());
-    let mut stake_sum = 0;
-    for (root, stake) in rooted_stake {
-        stake_sum += stake;
-        if (stake_sum as f64 / total_stake as f64) > VOTE_THRESHOLD_SIZE {
-            return root;
-        }
-    }
-    0
-}
+#[cfg(test)]
+use solana_runtime::consensus::commitment::get_highest_super_majority_root;
 
 pub struct AggregateCommitmentService {
     t_commitment: JoinHandle<()>,
@@ -209,27 +201,13 @@ impl AggregateCommitmentService {
         aggregation_data: TowerCommitmentAggregationData,
         ancestors: Vec<u64>,
     ) -> CommitmentSlots {
-        let (block_commitment, rooted_stake) = Self::aggregate_commitment(
+        let mut new_block_commitment = calculate_commitment_cache(
             &ancestors,
             &aggregation_data.bank,
+            aggregation_data.root,
+            aggregation_data.total_stake,
             &aggregation_data.node_vote_state,
         );
-
-        let highest_super_majority_root =
-            get_highest_super_majority_root(rooted_stake, aggregation_data.total_stake);
-
-        let mut new_block_commitment = BlockCommitmentCache::new(
-            block_commitment,
-            aggregation_data.total_stake,
-            CommitmentSlots {
-                slot: aggregation_data.bank.slot(),
-                root: aggregation_data.root,
-                highest_confirmed_slot: aggregation_data.root,
-                highest_super_majority_root,
-            },
-        );
-        let highest_confirmed_slot = new_block_commitment.calculate_highest_confirmed_slot();
-        new_block_commitment.set_highest_confirmed_slot(highest_confirmed_slot);
 
         let mut w_block_commitment_cache = block_commitment_cache.write().unwrap();
 
@@ -246,39 +224,16 @@ impl AggregateCommitmentService {
     pub fn aggregate_commitment(
         ancestors: &[Slot],
         bank: &Bank,
-        (node_vote_pubkey, node_vote_state): &(Pubkey, TowerVoteState),
+        node_vote_state: &(Pubkey, TowerVoteState),
     ) -> (HashMap<Slot, BlockCommitment>, Vec<(Slot, u64)>) {
-        assert!(!ancestors.is_empty());
-
-        // Check ancestors is sorted
-        for a in ancestors.windows(2) {
-            assert!(a[0] < a[1]);
-        }
-
-        let mut commitment = HashMap::new();
-        let mut rooted_stake: Vec<(Slot, u64)> = Vec::new();
-        for (pubkey, (lamports, account)) in bank.vote_accounts().iter() {
-            if *lamports == 0 {
-                continue;
-            }
-            let vote_state = if pubkey == node_vote_pubkey {
-                // Override old vote_state in bank with latest one for my own vote pubkey
-                node_vote_state.clone()
-            } else {
-                TowerVoteState::from(account.vote_state_view())
-            };
-            Self::aggregate_commitment_for_vote_account(
-                &mut commitment,
-                &mut rooted_stake,
-                &vote_state,
-                ancestors,
-                *lamports,
-            );
-        }
-
-        (commitment, rooted_stake)
+        solana_runtime::consensus::commitment::aggregate_commitment(
+            ancestors,
+            bank,
+            node_vote_state,
+        )
     }
 
+    #[cfg(test)]
     fn aggregate_commitment_for_vote_account(
         commitment: &mut HashMap<Slot, BlockCommitment>,
         rooted_stake: &mut Vec<(Slot, u64)>,
@@ -286,36 +241,13 @@ impl AggregateCommitmentService {
         ancestors: &[Slot],
         lamports: u64,
     ) {
-        assert!(!ancestors.is_empty());
-        let mut ancestors_index = 0;
-        if let Some(root) = vote_state.root_slot {
-            for (i, a) in ancestors.iter().enumerate() {
-                if *a <= root {
-                    commitment
-                        .entry(*a)
-                        .or_default()
-                        .increase_rooted_stake(lamports);
-                } else {
-                    ancestors_index = i;
-                    break;
-                }
-            }
-            rooted_stake.push((root, lamports));
-        }
-
-        for vote in &vote_state.votes {
-            while ancestors[ancestors_index] <= vote.slot() {
-                commitment
-                    .entry(ancestors[ancestors_index])
-                    .or_default()
-                    .increase_confirmation_stake(vote.confirmation_count() as usize, lamports);
-                ancestors_index += 1;
-
-                if ancestors_index == ancestors.len() {
-                    return;
-                }
-            }
-        }
+        solana_runtime::consensus::commitment::aggregate_commitment_for_vote_account(
+            commitment,
+            rooted_stake,
+            vote_state,
+            ancestors,
+            lamports,
+        );
     }
 
     pub fn join(self) -> thread::Result<()> {

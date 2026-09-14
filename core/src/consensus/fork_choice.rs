@@ -2,7 +2,7 @@ use {
     super::heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
     crate::{
         consensus::{
-            SWITCH_FORK_THRESHOLD, SwitchForkDecision, ThresholdDecision, Tower,
+            ComputedBankState, SWITCH_FORK_THRESHOLD, SwitchForkDecision, ThresholdDecision, Tower,
             latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
             progress_map::ProgressMap,
         },
@@ -62,6 +62,60 @@ pub trait ForkChoice {
         &mut self,
         valid_slot: &Self::ForkChoiceKey,
     ) -> Vec<Self::ForkChoiceKey>;
+}
+
+/// Native bank-local vote capture followed by the native HSF update. ReplayStage
+/// calls this after on-chain Tower adoption and before publishing progress stats
+/// or applying migration decisions. Other replay consumers must preserve that
+/// ordering; this function neither selects a root nor invents progress hashes.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_bank_vote_stats(
+    vote_account_pubkey: &solana_pubkey::Pubkey,
+    bank: &Bank,
+    root: Slot,
+    ancestors: &HashMap<Slot, HashSet<Slot>>,
+    progress: &ProgressMap,
+    tower: &Tower,
+    fork_choice: &mut HeaviestSubtreeForkChoice,
+    latest_votes: &mut LatestValidatorVotesForFrozenBanks,
+    vote_slots: &mut HashSet<Slot, ahash::RandomState>,
+) -> ComputedBankState {
+    let state = Tower::collect_vote_lockouts(
+        vote_account_pubkey,
+        bank.slot(),
+        bank.parent_slot(),
+        root,
+        &bank.vote_accounts(),
+        ancestors,
+        |slot| progress.get_hash(slot),
+        latest_votes,
+        vote_slots,
+    );
+    fork_choice.compute_bank_stats(bank, tower, latest_votes);
+    state
+}
+
+/// Refresh the production Tower-dependent selection fields after collecting
+/// bank-local stats and processing propagation evidence.
+pub fn cache_tower_stats(
+    progress: &mut ProgressMap,
+    tower: &Tower,
+    slot: Slot,
+    ancestors: &HashMap<Slot, HashSet<Slot>>,
+) {
+    let stats = progress
+        .get_fork_stats_mut(slot)
+        .expect("All frozen banks must exist in the Progress map");
+    stats.vote_threshold =
+        tower.check_vote_stake_thresholds(slot, &stats.voted_stakes, stats.total_stake);
+    stats.is_locked_out = tower.is_locked_out(
+        slot,
+        ancestors
+            .get(&slot)
+            .expect("Ancestors map should contain slot for is_locked_out() check"),
+    );
+    stats.has_voted = tower.has_voted(slot);
+    stats.is_recent = tower.is_recent(slot);
 }
 
 fn last_vote_able_to_land(

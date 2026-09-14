@@ -1,3 +1,5 @@
+pub mod commitment;
+pub mod confirmation;
 pub mod heaviest_subtree_fork_choice;
 pub mod latest_validator_votes_for_frozen_banks;
 pub mod tower_vote_state;

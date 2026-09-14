@@ -1,5 +1,3 @@
-#[cfg(feature = "dev-context-only-utils")]
-use qualifier_attr::qualifiers;
 use {
     crate::{
         consensus::heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
@@ -13,14 +11,11 @@ use {
     std::collections::{BTreeMap, BTreeSet, HashMap},
 };
 
-#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-pub(crate) type DuplicateSlotsTracker = BTreeSet<Slot>;
-pub(crate) type DuplicateSlotsToRepair = HashMap<Slot, Hash>;
-pub(crate) type PurgeRepairSlotCounter = BTreeMap<Slot, usize>;
-#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-pub(crate) type EpochSlotsFrozenSlots = BTreeMap<Slot, Hash>;
-#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-pub(crate) type DuplicateConfirmedSlots = BTreeMap<Slot, Hash>;
+pub type DuplicateSlotsTracker = BTreeSet<Slot>;
+pub type DuplicateSlotsToRepair = HashMap<Slot, Hash>;
+pub type PurgeRepairSlotCounter = BTreeMap<Slot, usize>;
+pub type EpochSlotsFrozenSlots = BTreeMap<Slot, Hash>;
+pub type DuplicateConfirmedSlots = BTreeMap<Slot, Hash>;
 
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum ClusterConfirmedHash {
@@ -840,7 +835,7 @@ fn apply_state_changes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn check_slot_agrees_with_cluster(
+pub fn check_slot_agrees_with_cluster(
     slot: Slot,
     root: Slot,
     blockstore: &Blockstore,

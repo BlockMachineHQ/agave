@@ -10,8 +10,8 @@ use {
         cluster_slots_service::{ClusterSlotsUpdateSender, cluster_slots::ClusterSlots},
         commitment_service::TowerCommitmentAggregationData,
         consensus::{
-            BlockhashStatus, ComputedBankState, SWITCH_FORK_THRESHOLD, Stake, SwitchForkDecision,
-            Tower, TowerError, VotedStakes,
+            BlockhashStatus, ComputedBankState, Stake, SwitchForkDecision, Tower, TowerError,
+            VotedStakes,
             fork_choice::{ForkChoice, SelectVoteAndResetForkResult, select_vote_and_reset_forks},
             heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
             latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
@@ -126,8 +126,9 @@ use {
 pub const MAX_ENTRY_RECV_PER_ITER: usize = 512;
 pub const SUPERMINORITY_THRESHOLD: f64 = 1f64 / 3f64;
 pub const MAX_UNCONFIRMED_SLOTS: usize = 5;
-pub const DUPLICATE_LIVENESS_THRESHOLD: f64 = 0.1;
-pub const DUPLICATE_THRESHOLD: f64 = 1.0 - SWITCH_FORK_THRESHOLD - DUPLICATE_LIVENESS_THRESHOLD;
+pub use solana_runtime::consensus::confirmation::{
+    DUPLICATE_LIVENESS_THRESHOLD, DUPLICATE_THRESHOLD,
+};
 const ASYNC_VERIFICATION_FREELIST_CAPACITY: usize = 5;
 
 pub(crate) const MAX_VOTE_SIGNATURES: usize = 200;
@@ -3117,7 +3118,7 @@ impl ReplayStage {
         // servicing RPC requests. However, this eliminates artificial 1-slot delay of the
         // `finalized` confirmation if a node is materially staked and servicing RPC requests at
         // the same time for development purposes.
-        let node_vote_state = (*vote_account_pubkey, tower.vote_state.clone());
+        let node_vote_state = (*vote_account_pubkey, tower.vote_state().clone());
         Self::update_commitment_cache(
             bank.clone(),
             bank_forks.read().unwrap().root(),
@@ -4429,24 +4430,18 @@ impl ReplayStage {
                     );
 
                     let root_slot = bank_forks.read().unwrap().root();
-                    let computed_bank_state = Tower::collect_vote_lockouts(
-                        my_vote_pubkey,
-                        bank_slot,
-                        bank.parent_slot(),
-                        root_slot,
-                        &bank.vote_accounts(),
-                        ancestors,
-                        |slot| progress.get_hash(slot),
-                        latest_validator_votes_for_frozen_banks,
-                        vote_slots,
-                    );
-                    // Notify any listeners of the votes found in this newly computed
-                    // bank
-                    heaviest_subtree_fork_choice.compute_bank_stats(
-                        bank,
-                        tower,
-                        latest_validator_votes_for_frozen_banks,
-                    );
+                    let computed_bank_state =
+                        crate::consensus::fork_choice::collect_bank_vote_stats(
+                            my_vote_pubkey,
+                            bank,
+                            root_slot,
+                            ancestors,
+                            progress,
+                            tower,
+                            heaviest_subtree_fork_choice,
+                            latest_validator_votes_for_frozen_banks,
+                            vote_slots,
+                        );
                     let ComputedBankState {
                         voted_stakes,
                         total_stake,
@@ -4664,20 +4659,7 @@ impl ReplayStage {
         slot: Slot,
         ancestors: &HashMap<u64, HashSet<u64>>,
     ) {
-        let stats = progress
-            .get_fork_stats_mut(slot)
-            .expect("All frozen banks must exist in the Progress map");
-
-        stats.vote_threshold =
-            tower.check_vote_stake_thresholds(slot, &stats.voted_stakes, stats.total_stake);
-        stats.is_locked_out = tower.is_locked_out(
-            slot,
-            ancestors
-                .get(&slot)
-                .expect("Ancestors map should contain slot for is_locked_out() check"),
-        );
-        stats.has_voted = tower.has_voted(slot);
-        stats.is_recent = tower.is_recent(slot);
+        crate::consensus::fork_choice::cache_tower_stats(progress, tower, slot, ancestors);
     }
 
     fn update_propagation_status(
