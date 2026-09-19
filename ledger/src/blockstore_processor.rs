@@ -1071,50 +1071,84 @@ fn verify_ticks(
     tick_hash_count: &mut u64,
     migration_status: &MigrationStatus,
 ) -> std::result::Result<(), BlockError> {
-    let next_bank_tick_height = bank.tick_height() + entries.tick_count();
-    let max_bank_tick_height = bank.max_tick_height();
+    verify_ticks_with_context(
+        TickVerificationContext {
+            slot: bank.slot(),
+            tick_height: bank.tick_height(),
+            max_tick_height: bank.max_tick_height(),
+            hashes_per_tick: bank.hashes_per_tick(),
+            alpenglow_ticks: migration_status.should_have_alpenglow_ticks(bank.slot()),
+        },
+        entries,
+        slot_full,
+        tick_hash_count,
+    )
+}
+
+/// Actual bank inputs to entry-segment tick verification. Callers must preserve
+/// the bank's current tick height and migration state, rather than infer them
+/// from the segment length. Hash counts carry across segments of the same bank.
+#[derive(Clone, Copy, Debug)]
+pub struct TickVerificationContext {
+    pub slot: Slot,
+    pub tick_height: u64,
+    pub max_tick_height: u64,
+    pub hashes_per_tick: Option<u64>,
+    pub alpenglow_ticks: bool,
+}
+
+/// Shared production tick validation, independent of account storage ownership.
+/// Error ordering and accumulator mutation are identical to `verify_ticks`.
+pub fn verify_ticks_with_context(
+    context: TickVerificationContext,
+    entries: &[Entry],
+    slot_full: bool,
+    tick_hash_count: &mut u64,
+) -> std::result::Result<(), BlockError> {
+    let next_bank_tick_height = context.tick_height + entries.tick_count();
+    let max_bank_tick_height = context.max_tick_height;
 
     if next_bank_tick_height > max_bank_tick_height {
-        warn!("Too many entry ticks found in slot: {}", bank.slot());
+        warn!("Too many entry ticks found in slot: {}", context.slot);
         return Err(BlockError::TooManyTicks);
     }
 
     if next_bank_tick_height < max_bank_tick_height && slot_full {
-        info!("Too few entry ticks found in slot: {}", bank.slot());
+        info!("Too few entry ticks found in slot: {}", context.slot);
         return Err(BlockError::TooFewTicks);
     }
 
     if next_bank_tick_height == max_bank_tick_height {
         let has_trailing_entry = entries.last().map(|e| !e.is_tick()).unwrap_or_default();
         if has_trailing_entry {
-            warn!("Slot: {} did not end with a tick entry", bank.slot());
+            warn!("Slot: {} did not end with a tick entry", context.slot);
             return Err(BlockError::TrailingEntry);
         }
 
         if !slot_full {
-            warn!("Slot: {} was not marked full", bank.slot());
+            warn!("Slot: {} was not marked full", context.slot);
             return Err(BlockError::InvalidLastTick);
         }
     }
 
-    if migration_status.should_have_alpenglow_ticks(bank.slot()) {
+    if context.alpenglow_ticks {
         // When alpenglow is active, PoH MUST be in low power mode.
         // We require that each block only has 1 tick at the very end
         if entries.iter().any(|entry| entry.num_hashes != 1) {
             warn!(
                 "Alpenglow entry with invalid num_hashes found in slot: {}",
-                bank.slot()
+                context.slot
             );
             return Err(BlockError::InvalidTickHashCount);
         }
         return Ok(());
     }
 
-    let hashes_per_tick = bank.hashes_per_tick().unwrap_or(0);
+    let hashes_per_tick = context.hashes_per_tick.unwrap_or(0);
     if !entries.verify_tick_hash_count(tick_hash_count, hashes_per_tick) {
         warn!(
             "Tick with invalid number of hashes found in slot: {}",
-            bank.slot()
+            context.slot
         );
         return Err(BlockError::InvalidTickHashCount);
     }
@@ -1559,10 +1593,12 @@ impl ConfirmationProgress {
     }
 }
 
-struct AsyncVerificationResult {
-    poh_verify_elapsed: u64,
-    transaction_verify_elapsed: u64,
-    error: Option<BlockstoreProcessorError>,
+/// One completed native verification job. Durations are microseconds and may
+/// overlap other jobs; they are not additive replay wall time.
+pub struct AsyncVerificationResult {
+    pub poh_verify_elapsed: u64,
+    pub transaction_verify_elapsed: u64,
+    pub error: Option<BlockstoreProcessorError>,
 }
 
 pub struct AsyncVerificationProgress {
@@ -1597,7 +1633,10 @@ impl AsyncVerificationProgress {
     // Spawns the given work on the given thread pool. The result, once
     // available, can be collected by calling `collect_available_results()` or
     // `wait_for_all_results()`.
-    fn spawn(
+    /// Submit owned verification work using the production result queue. The
+    /// caller must drain before successful completion or reuse. Work must return
+    /// a result; Rayon pool panic handling remains the caller's responsibility.
+    pub fn spawn(
         &mut self,
         replay_tx_thread_pool: &ThreadPool,
         poh_verify_elapsed: &mut u64,
@@ -1622,7 +1661,7 @@ impl AsyncVerificationProgress {
     }
 
     // Collects all available results from the channel.
-    fn collect_available_results(
+    pub fn collect_available_results(
         &mut self,
         poh_verify_elapsed: &mut u64,
         transaction_verify_elapsed: &mut u64,
@@ -1639,7 +1678,7 @@ impl AsyncVerificationProgress {
     // Waits for all pending jobs to complete and collects their results.
     //
     // This MUST be called at the end of a slot.
-    fn wait_for_all_results(
+    pub fn wait_for_all_results(
         &mut self,
         poh_verify_elapsed: &mut u64,
         transaction_verify_elapsed: &mut u64,
@@ -2959,6 +2998,215 @@ pub mod tests {
         test_case::test_matrix,
         trees::tr,
     };
+
+    #[test]
+    fn test_shared_tick_verification_segments_and_errors() {
+        let context = TickVerificationContext {
+            slot: 5,
+            tick_height: 4,
+            max_tick_height: 12,
+            hashes_per_tick: Some(4),
+            alpenglow_ticks: false,
+        };
+        let entries = create_ticks(8, 4, Hash::default());
+        assert_eq!(
+            verify_ticks_with_context(context, &entries, true, &mut 0),
+            Ok(())
+        );
+        assert_eq!(
+            verify_ticks_with_context(context, &entries, false, &mut 0),
+            Err(BlockError::InvalidLastTick)
+        );
+        assert_eq!(
+            verify_ticks_with_context(context, &entries[..7], true, &mut 0),
+            Err(BlockError::TooFewTicks)
+        );
+        assert_eq!(
+            verify_ticks_with_context(context, &create_ticks(9, 4, Hash::default()), true, &mut 0),
+            Err(BlockError::TooManyTicks)
+        );
+        // A transaction entry splits the hashes of one tick across batches.
+        let payer = Keypair::new();
+        let tx = system_transaction::transfer(&payer, &Pubkey::new_unique(), 1, Hash::default());
+        let prefix = Entry::new(&Hash::default(), 1, vec![tx]);
+        let tick = Entry::new(&prefix.hash, 3, vec![]);
+        let mut count = 0;
+        assert_eq!(
+            verify_ticks_with_context(context, &[prefix], false, &mut count),
+            Ok(())
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            verify_ticks_with_context(context, &[tick], false, &mut count),
+            Ok(())
+        );
+        assert_eq!(count, 0);
+        // Actual partial progress advances the bank tick height between batches.
+        assert_eq!(
+            verify_ticks_with_context(context, &entries[..3], false, &mut count),
+            Ok(())
+        );
+        assert_eq!(
+            verify_ticks_with_context(
+                TickVerificationContext {
+                    tick_height: 7,
+                    ..context
+                },
+                &entries[3..],
+                true,
+                &mut count,
+            ),
+            Ok(())
+        );
+        let mut bad_hashes = entries.clone();
+        bad_hashes[0].num_hashes = 3;
+        assert_eq!(
+            verify_ticks_with_context(context, &bad_hashes, true, &mut 0),
+            Err(BlockError::InvalidTickHashCount)
+        );
+        assert_eq!(
+            verify_ticks_with_context(
+                TickVerificationContext {
+                    hashes_per_tick: None,
+                    ..context
+                },
+                &bad_hashes,
+                true,
+                &mut 0,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_ticks_with_context(
+                TickVerificationContext {
+                    alpenglow_ticks: true,
+                    ..context
+                },
+                &entries,
+                true,
+                &mut 0,
+            ),
+            Err(BlockError::InvalidTickHashCount)
+        );
+        assert_eq!(
+            verify_ticks_with_context(
+                TickVerificationContext {
+                    alpenglow_ticks: true,
+                    ..context
+                },
+                &create_ticks(8, 1, Hash::default()),
+                true,
+                &mut 0,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_shared_tick_verification_matches_bank_context() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100);
+        let (bank, _forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let context = TickVerificationContext {
+            slot: bank.slot(),
+            tick_height: bank.tick_height(),
+            max_tick_height: bank.max_tick_height(),
+            hashes_per_tick: bank.hashes_per_tick(),
+            alpenglow_ticks: false,
+        };
+        let remaining = context.max_tick_height - context.tick_height;
+        for count in [0, remaining.saturating_sub(1), remaining, remaining + 1] {
+            let entries = create_ticks(
+                count,
+                context.hashes_per_tick.unwrap_or(1),
+                bank.last_blockhash(),
+            );
+            for full in [false, true] {
+                let mut native_count = 0;
+                let mut shared_count = 0;
+                assert_eq!(
+                    verify_ticks(
+                        &bank,
+                        &entries,
+                        full,
+                        &mut native_count,
+                        &MigrationStatus::default()
+                    ),
+                    verify_ticks_with_context(context, &entries, full, &mut shared_count),
+                );
+                assert_eq!(native_count, shared_count);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_async_verification_drain_and_reuse() {
+        let pool = create_thread_pool(2);
+        let mut progress = AsyncVerificationProgress::new();
+        let (release, wait) = bounded::<()>(1);
+        let (finished, completion) = bounded(1);
+        let mut poh = 0;
+        let mut signatures = 0;
+        // Keep PoH pending while the independent signature job completes.
+        progress
+            .spawn(&pool, &mut poh, &mut signatures, move || {
+                wait.recv().unwrap();
+                AsyncVerificationResult {
+                    poh_verify_elapsed: 7,
+                    transaction_verify_elapsed: 0,
+                    error: Some(BlockstoreProcessorError::InvalidBlock(
+                        BlockError::InvalidEntryHash,
+                    )),
+                }
+            })
+            .unwrap();
+        progress
+            .spawn(&pool, &mut poh, &mut signatures, move || {
+                finished.send(()).unwrap();
+                AsyncVerificationResult {
+                    poh_verify_elapsed: 0,
+                    transaction_verify_elapsed: 11,
+                    error: Some(BlockstoreProcessorError::InvalidTransaction(
+                        TransactionError::SignatureFailure,
+                    )),
+                }
+            })
+            .unwrap();
+        completion.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Observe actual result arrival, rather than assuming send ordering from
+        // the notification inside the job above.
+        let result = progress
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        progress.apply_result(result, &mut poh, &mut signatures);
+        assert_eq!(progress.pending_jobs, 1);
+        release.send(()).unwrap();
+        assert_matches!(
+            progress.wait_for_all_results(&mut poh, &mut signatures),
+            Err(BlockstoreProcessorError::InvalidTransaction(
+                TransactionError::SignatureFailure
+            ))
+        );
+        assert_eq!(progress.pending_jobs, 0);
+        assert_eq!((poh, signatures), (7, 11));
+        // The first error has been consumed; no prior-bank result survives reuse.
+        progress
+            .collect_available_results(&mut poh, &mut signatures)
+            .unwrap();
+        progress
+            .spawn(&pool, &mut poh, &mut signatures, || {
+                AsyncVerificationResult {
+                    poh_verify_elapsed: 13,
+                    transaction_verify_elapsed: 0,
+                    error: None,
+                }
+            })
+            .unwrap();
+        progress
+            .wait_for_all_results(&mut poh, &mut signatures)
+            .unwrap();
+        assert_eq!((poh, signatures), (20, 11));
+    }
 
     /// Generate a dummy alpenglow genesis certificate
     fn genesis_certificate(genesis_block: Block) -> Arc<Certificate> {
