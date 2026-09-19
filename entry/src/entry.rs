@@ -326,13 +326,30 @@ impl EntryVerificationState {
     }
 }
 
+/// Coordinates within the supplied entry batch, including tick entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryTransactionIndex {
+    pub entry_index: usize,
+    pub transaction_index: usize,
+}
+
+/// The error selected by native collection, with its original input coordinates.
+/// Parallel collection does not promise the lowest failing entry index.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("transaction at {index:?}: {error}")]
+pub struct EntryTransactionError {
+    pub index: EntryTransactionIndex,
+    pub error: TransactionError,
+}
+
 fn validate_and_hash_entry_transactions<Tx: TransactionWithMeta, F>(
+    entry_index: usize,
     entry: Entry,
     verify: &F,
     unverified_signatures: &mut UnverifiedSignatures,
-) -> Result<EntryType<Tx>>
+) -> std::result::Result<EntryType<Tx>, EntryTransactionError>
 where
-    F: Fn(VersionedTransaction, &[u8]) -> Result<Tx>,
+    F: Fn(EntryTransactionIndex, VersionedTransaction, &[u8]) -> Result<Tx>,
 {
     if entry.transactions.is_empty() {
         return Ok(EntryType::Tick(entry.hash));
@@ -341,16 +358,25 @@ where
     let verified_transactions = entry
         .transactions
         .into_iter()
-        .map(|versioned_tx| {
+        .enumerate()
+        .map(|(transaction_index, versioned_tx)| {
+            let index = EntryTransactionIndex {
+                entry_index,
+                transaction_index,
+            };
             let num_signers = usize::from(versioned_tx.message.header().num_required_signatures);
             let static_account_keys = versioned_tx.message.static_account_keys();
             if static_account_keys.len() < num_signers {
-                return Err(TransactionError::SanitizeFailure);
+                return Err(EntryTransactionError {
+                    index,
+                    error: TransactionError::SanitizeFailure,
+                });
             }
             let signatures = versioned_tx.signatures.iter().copied().collect();
             let signer_pubkeys = static_account_keys[..num_signers].iter().copied().collect();
             let serialized_message = versioned_tx.message.serialize();
-            let verified_transaction = verify(versioned_tx, &serialized_message)?;
+            let verified_transaction = verify(index, versioned_tx, &serialized_message)
+                .map_err(|error| EntryTransactionError { index, error })?;
             let message_hash = *verified_transaction.message_hash();
             unverified_signatures.signatures.push(TxVerificationData {
                 is_simple_vote: verified_transaction.is_simple_vote_transaction(),
@@ -362,7 +388,7 @@ where
 
             Ok(verified_transaction)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(EntryType::Transactions(verified_transactions))
 }
 
@@ -379,15 +405,40 @@ pub fn validate_and_hash_transactions<Tx: TransactionWithMeta + Send + Sync, F>(
 where
     F: Fn(VersionedTransaction, &[u8]) -> Result<Tx> + Send + Sync,
 {
+    validate_and_hash_transactions_with_indexes(entries, num_txs, thread_pool, |_, tx, bytes| {
+        verify(tx, bytes)
+    })
+    .map_err(|error| error.error)
+}
+
+/// Native validation with coordinates attached to callbacks and returned errors.
+/// The unindexed production entry point delegates here, preserving its threshold,
+/// entry ordering, signature collection and parallel error selection. Callers must
+/// still verify the returned signatures separately.
+pub fn validate_and_hash_transactions_with_indexes<Tx: TransactionWithMeta + Send + Sync, F>(
+    entries: Vec<Entry>,
+    num_txs: usize,
+    thread_pool: &ThreadPool,
+    verify: F,
+) -> std::result::Result<ValidatedHashedTransactions<Tx>, EntryTransactionError>
+where
+    F: Fn(EntryTransactionIndex, VersionedTransaction, &[u8]) -> Result<Tx> + Send + Sync,
+{
     const PARALLEL_VERIFY_THRESHOLD: usize = 200;
     if num_txs < PARALLEL_VERIFY_THRESHOLD {
         let mut unverified_signatures = UnverifiedSignatures::with_capacity(num_txs);
         let entries = entries
             .into_iter()
-            .map(|entry| {
-                validate_and_hash_entry_transactions(entry, &verify, &mut unverified_signatures)
+            .enumerate()
+            .map(|(entry_index, entry)| {
+                validate_and_hash_entry_transactions(
+                    entry_index,
+                    entry,
+                    &verify,
+                    &mut unverified_signatures,
+                )
             })
-            .collect::<Result<_>>()?;
+            .collect::<std::result::Result<_, _>>()?;
         return Ok(ValidatedHashedTransactions {
             entries,
             unverified_signatures,
@@ -397,17 +448,19 @@ where
     let verified = thread_pool.install(|| {
         entries
             .into_par_iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(entry_index, entry)| {
                 let mut unverified_signatures =
                     UnverifiedSignatures::with_capacity(entry.transactions.len());
                 let verified_entry = validate_and_hash_entry_transactions(
+                    entry_index,
                     entry,
                     &verify,
                     &mut unverified_signatures,
                 )?;
                 Ok((verified_entry, unverified_signatures))
             })
-            .collect::<Result<Vec<_>>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
     })?;
 
     let mut entries = Vec::with_capacity(verified.len());
@@ -705,6 +758,190 @@ mod tests {
             &thread_pool,
             verify_transaction
         ));
+    }
+
+    fn indexed_test_transaction(
+        tx: VersionedTransaction,
+        bytes: &[u8],
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        RuntimeTransaction::try_create(
+            tx,
+            MessageHash::Precomputed(solana_message::VersionedMessage::hash_raw_message(bytes)),
+            None,
+            SimpleAddressLoader::Disabled,
+            &ReservedAccountKeys::empty_key_set(),
+            true,
+        )
+    }
+
+    #[test]
+    fn test_indexed_validation_threshold_coordinates_and_signature_order() {
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let payer = Keypair::new();
+        for count in [199, 200, 201] {
+            for width in [1, 7, count] {
+                let txs: Vec<_> = (0..count)
+                    .map(|i| {
+                        VersionedTransaction::from(system_transaction::transfer(
+                            &payer,
+                            &payer.pubkey(),
+                            i as u64,
+                            Hash::default(),
+                        ))
+                    })
+                    .collect();
+                let mut entries = vec![Entry::default()];
+                for chunk in txs.chunks(width) {
+                    entries.push(Entry {
+                        transactions: chunk.to_vec(),
+                        ..Entry::default()
+                    });
+                    entries.push(Entry::default());
+                }
+                let expected: Vec<_> = entries
+                    .iter()
+                    .map(|entry| entry.transactions.clone())
+                    .collect();
+                let native = validate_and_hash_transactions(
+                    entries.clone(),
+                    count,
+                    &pool,
+                    indexed_test_transaction,
+                )
+                .unwrap();
+                let indexed = validate_and_hash_transactions_with_indexes(
+                    entries,
+                    count,
+                    &pool,
+                    |index, tx, bytes| {
+                        assert_eq!(tx, expected[index.entry_index][index.transaction_index]);
+                        if count >= 200 {
+                            assert!(pool.current_thread_index().is_some());
+                        }
+                        indexed_test_transaction(tx, bytes)
+                    },
+                )
+                .unwrap();
+                assert_eq!(indexed.entries.len(), expected.len());
+                for (entry, expected) in indexed.entries.iter().zip(&expected) {
+                    match entry {
+                        EntryType::Tick(_) => assert!(expected.is_empty()),
+                        EntryType::Transactions(txs) => {
+                            assert_eq!(txs.len(), expected.len());
+                            for (tx, expected) in txs.iter().zip(expected) {
+                                assert_eq!(&tx.to_versioned_transaction(), expected);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    indexed.unverified_signatures.signatures,
+                    native.unverified_signatures.signatures
+                );
+                assert!(indexed.unverified_signatures.verify().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn test_indexed_validation_pre_callback_error() {
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let payer = Keypair::new();
+        let tx = VersionedTransaction::from(system_transaction::transfer(
+            &payer,
+            &payer.pubkey(),
+            1,
+            Hash::default(),
+        ));
+        for count in [199, 200, 201] {
+            let mut bad = tx.clone();
+            let solana_message::VersionedMessage::Legacy(message) = &mut bad.message else {
+                unreachable!()
+            };
+            message.header.num_required_signatures = 255;
+            let entries = vec![
+                Entry {
+                    transactions: vec![tx.clone(); count - 2],
+                    ..Entry::default()
+                },
+                Entry::default(),
+                Entry {
+                    transactions: vec![tx.clone(), bad],
+                    ..Entry::default()
+                },
+            ];
+            let error = validate_and_hash_transactions_with_indexes(
+                entries,
+                count,
+                &pool,
+                |index, tx, bytes| {
+                    assert_ne!(
+                        index,
+                        EntryTransactionIndex {
+                            entry_index: 2,
+                            transaction_index: 1
+                        }
+                    );
+                    indexed_test_transaction(tx, bytes)
+                },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.index,
+                EntryTransactionIndex {
+                    entry_index: 2,
+                    transaction_index: 1
+                }
+            );
+            assert_eq!(error.error, TransactionError::SanitizeFailure);
+        }
+    }
+
+    #[test]
+    fn test_indexed_validation_parallel_error_keeps_selected_coordinates() {
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let payer = Keypair::new();
+        let tx = VersionedTransaction::from(system_transaction::transfer(
+            &payer,
+            &payer.pubkey(),
+            1,
+            Hash::default(),
+        ));
+        let entries = vec![
+            Entry {
+                transactions: vec![tx.clone(); 100],
+                ..Entry::default()
+            },
+            Entry::default(),
+            Entry {
+                transactions: vec![tx; 100],
+                ..Entry::default()
+            },
+        ];
+        for _ in 0..32 {
+            let error = validate_and_hash_transactions_with_indexes::<
+                RuntimeTransaction<SanitizedTransaction>,
+                _,
+            >(entries.clone(), 200, &pool, |index, _, _| {
+                Err(if index.entry_index == 0 {
+                    TransactionError::InvalidAccountIndex
+                } else {
+                    TransactionError::AddressLookupTableNotFound
+                })
+            })
+            .err()
+            .unwrap();
+            assert_eq!(error.index.transaction_index, 0);
+            assert_eq!(
+                error.error,
+                match error.index.entry_index {
+                    0 => TransactionError::InvalidAccountIndex,
+                    2 => TransactionError::AddressLookupTableNotFound,
+                    _ => panic!("tick cannot fail transaction validation"),
+                }
+            );
+        }
     }
 
     #[test]
