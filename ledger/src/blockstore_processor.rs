@@ -75,7 +75,6 @@ use {
         result,
         sync::{Arc, Mutex, OnceLock, RwLock, atomic::AtomicBool},
         time::{Duration, Instant},
-        vec::Drain,
     },
     thiserror::Error,
 };
@@ -95,9 +94,50 @@ pub struct LockedTransactionsWithIndexes<Tx: SVMMessage> {
     starting_index: usize,
 }
 
-struct ReplayEntry {
-    entry: EntryType<RuntimeTransaction<SanitizedTransaction>>,
-    starting_index: usize,
+impl<Tx: SVMMessage> LockedTransactionsWithIndexes<Tx> {
+    /// Transfer the lock results, owned transactions and original ledger index.
+    /// The recipient must release successful locks, including on submission failure.
+    pub fn into_parts(self) -> (Vec<Result<()>>, Vec<RuntimeTransaction<Tx>>, usize) {
+        (self.lock_results, self.transactions, self.starting_index)
+    }
+}
+
+/// An already sanitized entry and its first transaction's ledger index.
+pub struct ReplayEntry {
+    pub entry: EntryType<RuntimeTransaction<SanitizedTransaction>>,
+    pub starting_index: usize,
+}
+
+/// Account-lock and batch integration for production entry delivery.
+///
+/// Implementations supply account locking, batch execution/submission and tick
+/// state. The shared loop owns buffering, lock retry and tick registration order.
+/// `process_batches` must release every successful lock in its input even when it
+/// returns an error; scheduler users can delegate to
+/// [`schedule_batches_with_callbacks`] for that contract.
+pub trait ReplayBatchProcessor {
+    type Error: From<TransactionError>;
+
+    fn try_lock_accounts(
+        &self,
+        transactions: &[RuntimeTransaction<SanitizedTransaction>],
+    ) -> Vec<Result<()>>;
+    fn unlock_accounts(
+        &self,
+        transactions: &[RuntimeTransaction<SanitizedTransaction>],
+        lock_results: &[Result<()>],
+    );
+    fn process_batches(
+        &mut self,
+        batches: impl ExactSizeIterator<Item = LockedTransactionsWithIndexes<SanitizedTransaction>>,
+    ) -> std::result::Result<(), Self::Error>;
+}
+
+/// Tick integration for the production entry delivery loop.
+pub trait ReplayEntryProcessor: ReplayBatchProcessor {
+    fn tick_height(&self) -> u64;
+    fn is_block_boundary(&self, tick_height: u64) -> bool;
+    fn register_tick(&mut self, hash: &Hash);
 }
 
 fn first_err(results: &[Result<()>]) -> Result<()> {
@@ -546,6 +586,29 @@ fn schedule_batches_for_execution(
     bank: &BankWithScheduler,
     locked_entries: impl Iterator<Item = LockedTransactionsWithIndexes<SanitizedTransaction>>,
 ) -> Result<()> {
+    schedule_batches_with_callbacks(
+        locked_entries,
+        |transactions, lock_results| {
+            bank.unlock_accounts(transactions.iter().zip(lock_results.iter()));
+        },
+        |transactions, indexes| {
+            // Widening usize index to OrderedTaskId (= u128) won't ever fail.
+            let task_ids = indexes.map(|i| i.try_into().unwrap());
+            bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))
+        },
+    )
+}
+
+/// Unlock each batch before submission, retaining the first submission error.
+/// Later batches are still unlocked but never submitted after that error.
+pub fn schedule_batches_with_callbacks<E>(
+    locked_entries: impl Iterator<Item = LockedTransactionsWithIndexes<SanitizedTransaction>>,
+    mut unlock: impl FnMut(&[RuntimeTransaction<SanitizedTransaction>], &[Result<()>]),
+    mut schedule: impl FnMut(
+        Vec<RuntimeTransaction<SanitizedTransaction>>,
+        std::ops::Range<usize>,
+    ) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
     // Track the first error encountered in the loop below, if any.
     // This error will be propagated to the replay stage, or Ok(()).
     let mut first_err = Ok(());
@@ -557,16 +620,12 @@ fn schedule_batches_for_execution(
     } in locked_entries
     {
         // unlock before sending to scheduler.
-        bank.unlock_accounts(transactions.iter().zip(lock_results.iter()));
+        unlock(&transactions, &lock_results);
         // give ownership to scheduler. capture the first error, but continue the loop
         // to unlock.
         // scheduling is skipped if we have already detected an error in this loop
         let indexes = starting_index..starting_index + transactions.len();
-        // Widening usize index to OrderedTaskId (= u128) won't ever fail.
-        let task_ids = indexes.map(|i| i.try_into().unwrap());
-        first_err = first_err.and_then(|()| {
-            bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))
-        });
+        first_err = first_err.and_then(|()| schedule(transactions, indexes));
     }
     first_err
 }
@@ -702,6 +761,84 @@ fn process_entries(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
 ) -> Result<()> {
+    let mut processor = BankReplayEntryProcessor {
+        bank,
+        replay_tx_thread_pool,
+        transaction_status_sender,
+        replay_vote_sender,
+        batch_timing,
+        log_messages_bytes_limit,
+        prioritization_fee_cache,
+    };
+    process_entries_with_processor(&mut processor, entries)
+}
+
+struct BankReplayEntryProcessor<'a> {
+    bank: &'a BankWithScheduler,
+    replay_tx_thread_pool: &'a ThreadPool,
+    transaction_status_sender: Option<&'a TransactionStatusSender>,
+    replay_vote_sender: Option<&'a ReplayVoteSender>,
+    batch_timing: &'a mut BatchExecutionTiming,
+    log_messages_bytes_limit: Option<usize>,
+    prioritization_fee_cache: Option<&'a PrioritizationFeeCache>,
+}
+
+impl ReplayBatchProcessor for BankReplayEntryProcessor<'_> {
+    type Error = TransactionError;
+
+    fn try_lock_accounts(
+        &self,
+        transactions: &[RuntimeTransaction<SanitizedTransaction>],
+    ) -> Vec<Result<()>> {
+        self.bank.try_lock_accounts(transactions)
+    }
+
+    fn unlock_accounts(
+        &self,
+        transactions: &[RuntimeTransaction<SanitizedTransaction>],
+        lock_results: &[Result<()>],
+    ) {
+        self.bank
+            .unlock_accounts(transactions.iter().zip(lock_results.iter()));
+    }
+
+    fn process_batches(
+        &mut self,
+        batches: impl ExactSizeIterator<Item = LockedTransactionsWithIndexes<SanitizedTransaction>>,
+    ) -> Result<()> {
+        process_batches(
+            self.bank,
+            self.replay_tx_thread_pool,
+            batches,
+            self.transaction_status_sender,
+            self.replay_vote_sender,
+            self.batch_timing,
+            self.log_messages_bytes_limit,
+            self.prioritization_fee_cache,
+        )
+    }
+}
+
+impl ReplayEntryProcessor for BankReplayEntryProcessor<'_> {
+    fn tick_height(&self) -> u64 {
+        self.bank.tick_height()
+    }
+
+    fn is_block_boundary(&self, tick_height: u64) -> bool {
+        self.bank.is_block_boundary(tick_height)
+    }
+
+    fn register_tick(&mut self, hash: &Hash) {
+        self.bank.register_tick(hash);
+    }
+}
+
+/// Deliver sanitized entries using native lock/drain/retry and tick ordering.
+/// Sanitation and asynchronous verification remain the caller's responsibility.
+pub fn process_entries_with_processor<P: ReplayEntryProcessor>(
+    processor: &mut P,
+    entries: impl IntoIterator<Item = ReplayEntry>,
+) -> std::result::Result<(), P::Error> {
     // accumulator for entries that can be processed in parallel
     let mut batches = vec![];
     let mut tick_hashes = vec![];
@@ -715,44 +852,23 @@ fn process_entries(
             EntryType::Tick(hash) => {
                 // If it's a tick, save it for later
                 tick_hashes.push(hash);
-                if bank.is_block_boundary(bank.tick_height() + tick_hashes.len() as u64) {
+                if processor.is_block_boundary(processor.tick_height() + tick_hashes.len() as u64) {
                     break;
                 }
             }
             EntryType::Transactions(transactions) => {
                 queue_batches_with_lock_retry(
-                    bank,
+                    processor,
                     starting_index,
                     transactions,
                     &mut batches,
-                    |batches| {
-                        process_batches(
-                            bank,
-                            replay_tx_thread_pool,
-                            batches,
-                            transaction_status_sender,
-                            replay_vote_sender,
-                            batch_timing,
-                            log_messages_bytes_limit,
-                            prioritization_fee_cache,
-                        )
-                    },
                 )?;
             }
         }
     }
-    process_batches(
-        bank,
-        replay_tx_thread_pool,
-        batches.into_iter(),
-        transaction_status_sender,
-        replay_vote_sender,
-        batch_timing,
-        log_messages_bytes_limit,
-        prioritization_fee_cache,
-    )?;
+    processor.process_batches(batches.into_iter())?;
     for hash in tick_hashes {
-        bank.register_tick(&hash);
+        processor.register_tick(&hash);
     }
     Ok(())
 }
@@ -763,17 +879,14 @@ fn process_entries(
 /// The locking process is retried, and if it fails again the block is marked
 /// as dead.
 /// If the lock retry succeeds, then the batch is pushed into `batches`.
-fn queue_batches_with_lock_retry(
-    bank: &Bank,
+pub fn queue_batches_with_lock_retry<P: ReplayBatchProcessor>(
+    processor: &mut P,
     starting_index: usize,
     transactions: Vec<RuntimeTransaction<SanitizedTransaction>>,
     batches: &mut Vec<LockedTransactionsWithIndexes<SanitizedTransaction>>,
-    mut process_batches: impl FnMut(
-        Drain<LockedTransactionsWithIndexes<SanitizedTransaction>>,
-    ) -> Result<()>,
-) -> Result<()> {
+) -> std::result::Result<(), P::Error> {
     // try to lock the accounts
-    let lock_results = bank.try_lock_accounts(&transactions);
+    let lock_results = processor.try_lock_accounts(&transactions);
     let first_lock_err = first_err(&lock_results);
     if first_lock_err.is_ok() {
         batches.push(LockedTransactionsWithIndexes {
@@ -786,7 +899,7 @@ fn queue_batches_with_lock_retry(
 
     // We need to unlock the transactions that succeeded to lock before the
     // retry.
-    bank.unlock_accounts(transactions.iter().zip(lock_results.iter()));
+    processor.unlock_accounts(&transactions, &lock_results);
 
     // We failed to lock, there are 2 possible reasons:
     // 1. A batch already in `batches` holds the lock.
@@ -794,10 +907,10 @@ fn queue_batches_with_lock_retry(
 
     // Use the callback to process batches, and clear them.
     // Clearing the batches will `Drop` the batches which will unlock the accounts.
-    process_batches(batches.drain(..))?;
+    processor.process_batches(batches.drain(..))?;
 
     // Retry the lock
-    let lock_results = bank.try_lock_accounts(&transactions);
+    let lock_results = processor.try_lock_accounts(&transactions);
     match first_err(&lock_results) {
         Ok(()) => {
             batches.push(LockedTransactionsWithIndexes {
@@ -809,7 +922,7 @@ fn queue_batches_with_lock_retry(
         }
         Err(err) => {
             // We still may have succeeded to lock some accounts, unlock them.
-            bank.unlock_accounts(transactions.iter().zip(lock_results.iter()));
+            processor.unlock_accounts(&transactions, &lock_results);
 
             // An entry has account lock conflicts with *itself*, which should not happen
             // if generated by a properly functioning leader
@@ -823,7 +936,7 @@ fn queue_batches_with_lock_retry(
                     String
                 )
             );
-            Err(err)
+            Err(err.into())
         }
     }
 }
@@ -4605,6 +4718,43 @@ pub mod tests {
 
         assert!(result.is_ok());
         assert_eq!(balances, [0, 3, 3]);
+    }
+
+    #[test]
+    fn test_process_entries_valid_prefix_before_duplicate_admission_failure() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(1000);
+        let (bank, _bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let prefix_recipient = Pubkey::new_unique();
+        let rejected_recipient = Pubkey::new_unique();
+        let prefix = next_entry(
+            &bank.last_blockhash(),
+            1,
+            vec![system_transaction::transfer(
+                &mint_keypair,
+                &prefix_recipient,
+                1,
+                bank.last_blockhash(),
+            )],
+        );
+        let duplicate = system_transaction::transfer(
+            &mint_keypair,
+            &rejected_recipient,
+            2,
+            bank.last_blockhash(),
+        );
+        let rejected = next_entry(&prefix.hash, 1, vec![duplicate.clone(), duplicate]);
+        assert_eq!(
+            process_entries_for_tests_without_scheduler(&bank, vec![prefix, rejected]),
+            Err(TransactionError::AlreadyProcessed)
+        );
+        assert_eq!(bank.get_balance(&prefix_recipient), 1);
+        assert_eq!(bank.get_balance(&rejected_recipient), 0);
+        assert_eq!(bank.transaction_count(), 1);
     }
 
     #[test]
