@@ -65,6 +65,8 @@ static ALLOCATOR: CountHeap = CountHeap;
 struct Context {
     gate: Arc<Barrier>,
     completed: Arc<AtomicUsize>,
+    fail: bool,
+    panic: bool,
 }
 impl ReplaySessionContext for Context {
     fn slot(&self) -> Slot {
@@ -77,7 +79,7 @@ impl ReplaySessionHandler for Handler {
     type Context = Context;
     type Services = ();
     fn handle(
-        _result: &mut TransactionResult<()>,
+        result: &mut TransactionResult<()>,
         _timings: &mut ExecuteTimings,
         context: &Context,
         task: &Task,
@@ -87,6 +89,10 @@ impl ReplaySessionHandler for Handler {
             context.gate.wait();
         }
         context.completed.fetch_add(1, Ordering::SeqCst);
+        assert!(!context.panic, "controlled resource-fixture panic");
+        if context.fail {
+            *result = Err(solana_transaction_error::TransactionError::AccountNotFound);
+        }
     }
 }
 
@@ -108,6 +114,8 @@ fn stalled_dependency_queue_heap_fits_reserved_metadata_envelope() {
             let context = Context {
                 gate: Arc::new(Barrier::new(2)),
                 completed: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+                panic: false,
             };
             let base = LIVE.load(Ordering::SeqCst);
             PEAK.store(base, Ordering::SeqCst);
@@ -137,5 +145,44 @@ fn stalled_dependency_queue_heap_fits_reserved_metadata_envelope() {
                 "session_heap tasks={count} handlers={width} peak_delta={peak} reserved={reservation}"
             );
         }
+    }
+    for panicking in [false, true] {
+        let base = LIVE.load(Ordering::SeqCst);
+        for _ in 0..16 {
+            let payer = Keypair::new();
+            let context = Context {
+                gate: Arc::new(Barrier::new(2)),
+                completed: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+                panic: panicking,
+            };
+            let session = ReplaySession::<Handler>::new(2, context.clone(), (), 2)
+                .with_fifo_initial_capacity(0);
+            for id in 0..128 {
+                let tx = RuntimeTransaction::from_transaction_for_tests(transfer(
+                    &payer,
+                    &Pubkey::new_unique(),
+                    1,
+                    Hash::default(),
+                ));
+                session.schedule_execution(tx, id).unwrap();
+            }
+            context.gate.wait();
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.finish()));
+            if panicking {
+                assert!(outcome.is_err());
+            } else {
+                let (result, idle) = outcome.unwrap();
+                assert!(result.0.is_err());
+                assert!(idle.is_none());
+            }
+        }
+        let retained = LIVE.load(Ordering::SeqCst).saturating_sub(base);
+        println!("session_abort_heap attempts=16 panicking={panicking} retained_delta={retained}");
+        assert!(
+            retained < 65536,
+            "aborted sessions retained task/usage-queue ownership"
+        );
     }
 }

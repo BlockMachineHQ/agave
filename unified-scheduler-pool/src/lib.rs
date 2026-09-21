@@ -814,7 +814,7 @@ mod chained_channel {
 struct UsageQueueLoaderInner {
     capability: Capability,
     fifo_initial_capacity: Option<usize>,
-    usage_queues: DashMap<Pubkey, UsageQueue>,
+    usage_queues: Arc<DashMap<Pubkey, UsageQueue>>,
 }
 
 impl UsageQueueLoaderInner {
@@ -822,7 +822,7 @@ impl UsageQueueLoaderInner {
         Self {
             capability,
             fifo_initial_capacity: None,
-            usage_queues: DashMap::default(),
+            usage_queues: Arc::new(DashMap::default()),
         }
     }
 
@@ -1190,10 +1190,14 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
         mut result_with_timings: ResultWithTimings,
         handler_context: H::Services,
         handler_count: usize,
+        queue_map: Arc<DashMap<Pubkey, UsageQueue>>,
     ) {
         assert!(handler_count >= 1);
         let mut current_slot = context.slot();
         let (mut is_finished, mut session_ending) = (false, false);
+        // Each handler owns one sender for its full lifetime. Disconnection is
+        // an exact exit barrier, including panics and partial thread startup.
+        let (handler_lifetime, handler_lifetimes) = crossbeam_channel::unbounded::<()>();
 
         // Firstly, setup bi-directional messaging between the scheduler and handlers to pass
         // around tasks, by creating 2 channels (one for to-be-handled tasks from the scheduler to
@@ -1365,211 +1369,236 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                 // 1. Initial result_with_timing is propagated implicitly by the moved variable.
                 // 2. Subsequent result_with_timings are propagated explicitly from
                 //    the new_task_receiver.recv() invocation located at the end of loop.
-                'nonaborted_main_loop: loop {
-                    while !is_finished {
-                        // ALL recv selectors are eager-evaluated ALWAYS by current crossbeam impl,
-                        // which isn't great and is inconsistent with `if`s in the Rust's match
-                        // arm. So, eagerly binding the result to a variable unconditionally here
-                        // makes no perf. difference...
-                        let dummy_unblocked_task_receiver =
-                            dummy_receiver(Self::can_receive_unblocked_task(&state_machine));
+                let coordinator_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        'nonaborted_main_loop: loop {
+                            while !is_finished {
+                                // ALL recv selectors are eager-evaluated ALWAYS by current crossbeam impl,
+                                // which isn't great and is inconsistent with `if`s in the Rust's match
+                                // arm. So, eagerly binding the result to a variable unconditionally here
+                                // makes no perf. difference...
+                                let dummy_unblocked_task_receiver = dummy_receiver(
+                                    Self::can_receive_unblocked_task(&state_machine),
+                                );
 
-                        // There's something special called dummy_unblocked_task_receiver here.
-                        // This odd pattern was needed to react to newly unblocked tasks from
-                        // _not-crossbeam-channel_ event sources, precisely at the specified
-                        // precedence among other selectors, while delegating the control flow to
-                        // select_biased!.
-                        //
-                        // In this way, hot looping is avoided and overall control flow is much
-                        // consistent. Note that unified scheduler will go
-                        // into busy looping to seek lowest latency eventually. However, not now,
-                        // to measure _actual_ cpu usage easily with the select approach.
-                        select_biased! {
-                            recv(finished_blocked_task_receiver) -> receiver_result => {
-                                let handler_result = receiver_result.expect("alive handler");
-                                let Ok(executed_task) = handler_result else {
-                                    handler_panicked = true;
-                                    break 'nonaborted_main_loop;
-                                };
-                                state_machine.deschedule_task(&executed_task.task);
+                                // There's something special called dummy_unblocked_task_receiver here.
+                                // This odd pattern was needed to react to newly unblocked tasks from
+                                // _not-crossbeam-channel_ event sources, precisely at the specified
+                                // precedence among other selectors, while delegating the control flow to
+                                // select_biased!.
+                                //
+                                // In this way, hot looping is avoided and overall control flow is much
+                                // consistent. Note that unified scheduler will go
+                                // into busy looping to seek lowest latency eventually. However, not now,
+                                // to measure _actual_ cpu usage easily with the select approach.
+                                select_biased! {
+                                    recv(finished_blocked_task_receiver) -> receiver_result => {
+                                        let handler_result = receiver_result.expect("alive handler");
+                                        let Ok(executed_task) = handler_result else {
+                                            handler_panicked = true;
+                                            break 'nonaborted_main_loop;
+                                        };
+                                        state_machine.deschedule_task(&executed_task.task);
 
-                                if Self::abort_or_accumulate_result_with_timings(
-                                    &mut result_with_timings,
-                                    executed_task,
-                                ) {
-                                    break 'nonaborted_main_loop;
-                                }
-                            },
-                            recv(dummy_unblocked_task_receiver) -> dummy => {
-                                assert_matches!(dummy, Err(RecvError));
-
-                                let task = state_machine
-                                    .schedule_next_task(|| None)
-                                    .expect("unblocked task");
-                                runnable_task_sender.send_payload(task).unwrap();
-                            },
-                            recv(new_task_receiver) -> message => {
-                                assert!(!session_ending);
-
-                                match message {
-                                    Ok(NewTaskPayload::Payload(task)) => {
-                                        let task_id = task.task_id();
-                                        sleepless_testing::at(CheckPoint::NewTask(task_id));
-
-                                        // The biased unblocked selector above has precedence, so
-                                        // there is no ready-unblocked work here. Verification has
-                                        // no running-task cap, and this arm asserts !session_ending.
-                                        // Admit only this selected message: polling further input
-                                        // here would bypass completion/control-message priorities.
-                                        let mut input = Some(task);
-                                        if let Some(task) = state_machine.schedule_next_task(|| input.take()) {
-                                            runnable_task_sender.send_aux_payload(task).unwrap();
-                                        } else {
-                                            sleepless_testing::at(CheckPoint::BufferedOrDroppedTask(task_id));
+                                        if Self::abort_or_accumulate_result_with_timings(
+                                            &mut result_with_timings,
+                                            executed_task,
+                                        ) {
+                                            break 'nonaborted_main_loop;
                                         }
-                                        assert!(input.is_none(), "selected input must be admitted");
+                                    },
+                                    recv(dummy_unblocked_task_receiver) -> dummy => {
+                                        assert_matches!(dummy, Err(RecvError));
+
+                                        let task = state_machine
+                                            .schedule_next_task(|| None)
+                                            .expect("unblocked task");
+                                        runnable_task_sender.send_payload(task).unwrap();
+                                    },
+                                    recv(new_task_receiver) -> message => {
+                                        assert!(!session_ending);
+
+                                        match message {
+                                            Ok(NewTaskPayload::Payload(task)) => {
+                                                let task_id = task.task_id();
+                                                sleepless_testing::at(CheckPoint::NewTask(task_id));
+
+                                                // The biased unblocked selector above has precedence, so
+                                                // there is no ready-unblocked work here. Verification has
+                                                // no running-task cap, and this arm asserts !session_ending.
+                                                // Admit only this selected message: polling further input
+                                                // here would bypass completion/control-message priorities.
+                                                let mut input = Some(task);
+                                                if let Some(task) = state_machine.schedule_next_task(|| input.take()) {
+                                                    runnable_task_sender.send_aux_payload(task).unwrap();
+                                                } else {
+                                                    sleepless_testing::at(CheckPoint::BufferedOrDroppedTask(task_id));
+                                                }
+                                                assert!(input.is_none(), "selected input must be admitted");
+                                            }
+                                            Ok(NewTaskPayload::CloseSubchannel) => {
+                                                sleepless_testing::at(CheckPoint::SessionEnding);
+                                                session_ending = true;
+                                            }
+                                            Ok(
+                                                NewTaskPayload::OpenSubchannel(_)
+                                                | NewTaskPayload::UnpauseOpenedSubchannel
+                                                | NewTaskPayload::Reset
+                                            )
+                                            | Err(RecvError) => unreachable!(),
+                                            Ok(NewTaskPayload::Disconnect) => {
+                                                // Mostly likely is that this scheduler is dropped for pruned blocks of
+                                                // abandoned forks...
+                                                // This short-circuiting is tested with test_scheduler_drop_short_circuiting.
+                                                break 'nonaborted_main_loop;
+                                            }
+                                        }
+                                    },
+                                    recv(finished_idle_task_receiver) -> receiver_result => {
+                                        let handler_result = receiver_result.expect("alive handler");
+                                        let Ok(executed_task) = handler_result else {
+                                            handler_panicked = true;
+                                            break 'nonaborted_main_loop;
+                                        };
+                                        state_machine.deschedule_task(&executed_task.task);
+
+                                        if Self::abort_or_accumulate_result_with_timings(
+                                            &mut result_with_timings,
+                                            executed_task,
+                                        ) {
+                                            break 'nonaborted_main_loop;
+                                        }
+                                    },
+                                };
+
+                                is_finished =
+                                    Self::can_finish_session(session_ending, &state_machine);
+                            }
+                            assert!(mem::replace(&mut is_finished, false));
+
+                            sleepless_testing::at(CheckPoint::SessionFinished(current_slot));
+                            // Finalize the current session after asserting it's explicitly requested so.
+                            // Send result first because this is blocking the replay code-path.
+                            session_result_sender
+                                .send(SessionResult {
+                                    result_with_timings,
+                                    handler_panicked: false,
+                                })
+                                .expect("always outlived receiver");
+
+                            state_machine.reinitialize();
+                            assert!(mem::replace(&mut session_ending, false));
+
+                            // This variable is hoisted from OpenSubchannel match arm to pass the rustc
+                            // borrow checker because it can't tell the control-flow diverging
+                            // UnpauseOpenedSubchannel won't be used by itself, which would leave
+                            // `result_with_timings` uninitialized after sending it via
+                            // session_result_sender just above
+                            let mut new_result_with_timings = None;
+
+                            let discard_on_reset = false;
+                            #[allow(clippy::never_loop)]
+                            loop {
+                                if discard_on_reset {
+                                    // Gracefully clear all buffered tasks to discard all outstanding stale
+                                    // tasks; we're not aborting scheduler here. So, `state_machine` needs
+                                    // to be reusable after this.
+                                    //
+                                    // As for panic safety of .clear_and_reinitialize(), it's safe because
+                                    // there should be _no scheduled tasks (i.e. owned by us, not by
+                                    // state_machine) on the call stack by now.
+                                    let count = state_machine.clear_and_reinitialize();
+                                    sleepless_testing::at(CheckPoint::Discarded(count));
+                                }
+                                // Prepare for the new session.
+                                match new_task_receiver.recv() {
+                                    Ok(NewTaskPayload::Payload(_task)) => {
+                                        unreachable!(
+                                            "cannot receive new task before session start"
+                                        );
+                                    }
+                                    Ok(NewTaskPayload::OpenSubchannel(
+                                        context_and_result_with_timings,
+                                    )) => {
+                                        let new_context = context_and_result_with_timings.0;
+                                        new_result_with_timings
+                                            .replace(context_and_result_with_timings.1)
+                                            .unwrap_none();
+                                        // We just received subsequent (= not initial) session and about to
+                                        // enter into the preceding `while(!is_finished) {...}` loop again.
+                                        // Before that, propagate new SchedulingContext to handler threads
+                                        current_slot = new_context.slot();
+                                        runnable_task_sender
+                                            .send_chained_channel(&new_context, handler_count)
+                                            .unwrap();
+
+                                        break;
+                                    }
+                                    Ok(NewTaskPayload::UnpauseOpenedSubchannel) => {
+                                        unreachable!("unpause without open is prohibited");
                                     }
                                     Ok(NewTaskPayload::CloseSubchannel) => {
-                                        sleepless_testing::at(CheckPoint::SessionEnding);
-                                        session_ending = true;
+                                        unreachable!("close without open is prohibited");
                                     }
-                                    Ok(
-                                        NewTaskPayload::OpenSubchannel(_)
-                                        | NewTaskPayload::UnpauseOpenedSubchannel
-                                        | NewTaskPayload::Reset
-                                    )
-                                    | Err(RecvError) => unreachable!(),
+                                    Ok(NewTaskPayload::Reset) => {
+                                        unreachable!("reset without open is prohibited");
+                                    }
                                     Ok(NewTaskPayload::Disconnect) => {
-                                        // Mostly likely is that this scheduler is dropped for pruned blocks of
-                                        // abandoned forks...
-                                        // This short-circuiting is tested with test_scheduler_drop_short_circuiting.
+                                        // This unusual condition must be triggered by ThreadManager::drop().
+                                        // Initialize result_with_timings with a harmless value...
+                                        result_with_timings = initialized_result_with_timings();
                                         break 'nonaborted_main_loop;
                                     }
+                                    Err(RecvError) => unreachable!(),
                                 }
-                            },
-                            recv(finished_idle_task_receiver) -> receiver_result => {
-                                let handler_result = receiver_result.expect("alive handler");
-                                let Ok(executed_task) = handler_result else {
-                                    handler_panicked = true;
-                                    break 'nonaborted_main_loop;
-                                };
-                                state_machine.deschedule_task(&executed_task.task);
-
-                                if Self::abort_or_accumulate_result_with_timings(
-                                    &mut result_with_timings,
-                                    executed_task,
-                                ) {
-                                    break 'nonaborted_main_loop;
-                                }
-                            },
-                        };
-
-                        is_finished = Self::can_finish_session(session_ending, &state_machine);
-                    }
-                    assert!(mem::replace(&mut is_finished, false));
-
-                    sleepless_testing::at(CheckPoint::SessionFinished(current_slot));
-                    // Finalize the current session after asserting it's explicitly requested so.
-                    // Send result first because this is blocking the replay code-path.
-                    session_result_sender
-                        .send(SessionResult {
-                            result_with_timings,
-                            handler_panicked: false,
-                        })
-                        .expect("always outlived receiver");
-
-                    state_machine.reinitialize();
-                    assert!(mem::replace(&mut session_ending, false));
-
-                    // This variable is hoisted from OpenSubchannel match arm to pass the rustc
-                    // borrow checker because it can't tell the control-flow diverging
-                    // UnpauseOpenedSubchannel won't be used by itself, which would leave
-                    // `result_with_timings` uninitialized after sending it via
-                    // session_result_sender just above
-                    let mut new_result_with_timings = None;
-
-                    let discard_on_reset = false;
-                    #[allow(clippy::never_loop)]
-                    loop {
-                        if discard_on_reset {
-                            // Gracefully clear all buffered tasks to discard all outstanding stale
-                            // tasks; we're not aborting scheduler here. So, `state_machine` needs
-                            // to be reusable after this.
-                            //
-                            // As for panic safety of .clear_and_reinitialize(), it's safe because
-                            // there should be _no scheduled tasks (i.e. owned by us, not by
-                            // state_machine) on the call stack by now.
-                            let count = state_machine.clear_and_reinitialize();
-                            sleepless_testing::at(CheckPoint::Discarded(count));
+                            }
+                            result_with_timings = new_result_with_timings.unwrap();
                         }
-                        // Prepare for the new session.
-                        match new_task_receiver.recv() {
-                            Ok(NewTaskPayload::Payload(_task)) => {
-                                unreachable!("cannot receive new task before session start");
-                            }
-                            Ok(NewTaskPayload::OpenSubchannel(context_and_result_with_timings)) => {
-                                let new_context = context_and_result_with_timings.0;
-                                new_result_with_timings
-                                    .replace(context_and_result_with_timings.1)
-                                    .unwrap_none();
-                                // We just received subsequent (= not initial) session and about to
-                                // enter into the preceding `while(!is_finished) {...}` loop again.
-                                // Before that, propagate new SchedulingContext to handler threads
-                                current_slot = new_context.slot();
-                                runnable_task_sender
-                                    .send_chained_channel(&new_context, handler_count)
-                                    .unwrap();
 
-                                break;
-                            }
-                            Ok(NewTaskPayload::UnpauseOpenedSubchannel) => {
-                                unreachable!("unpause without open is prohibited");
-                            }
-                            Ok(NewTaskPayload::CloseSubchannel) => {
-                                unreachable!("close without open is prohibited");
-                            }
-                            Ok(NewTaskPayload::Reset) => {
-                                unreachable!("reset without open is prohibited");
-                            }
-                            Ok(NewTaskPayload::Disconnect) => {
-                                // This unusual condition must be triggered by ThreadManager::drop().
-                                // Initialize result_with_timings with a harmless value...
-                                result_with_timings = initialized_result_with_timings();
-                                break 'nonaborted_main_loop;
-                            }
-                            Err(RecvError) => unreachable!(),
-                        }
-                    }
-                    result_with_timings = new_result_with_timings.unwrap();
+                        // There are several code-path reaching here out of the preceding unconditional
+                        // `loop { ... }` by the use of `break 'nonaborted_main_loop;`. This scheduler
+                        // thread will now initiate the termination process, indicating an abnormal abortion,
+                        // in order to be handled gracefully by other threads.
+
+                        // Firstly, send result_with_timings as-is, because it's expected for us to put the
+                        // last result_with_timings into the channel without exception. Usually,
+                        // result_with_timings will contain the Err variant at this point, indicating the
+                        // occurrence of transaction error.
+                        session_result_sender
+                            .send(SessionResult {
+                                result_with_timings,
+                                handler_panicked,
+                            })
+                            .expect("always outlived receiver");
+
+                        // Next, drop `new_task_receiver`. After that, the paired singleton
+                        // `new_task_sender` will start to error when called by external threads, resulting
+                        // in propagation of thread abortion to the external threads.
+                        drop(new_task_receiver);
+
+                        // We will now exit this thread finally... Good bye.
+                        sleepless_testing::at(CheckPoint::SchedulerThreadAborted);
+                    },
+                ));
+                // Wake completion and execution waiters before waiting for the
+                // handlers. Result receivers must close too, so a handler stops
+                // after its current task rather than consuming the idle backlog.
+                drop(session_result_sender);
+                drop(runnable_task_sender);
+                drop(finished_blocked_task_receiver);
+                drop(finished_idle_task_receiver);
+                let _ = handler_lifetimes.recv();
+                state_machine.retire_queues_after_worker_join(
+                    queue_map.iter().map(|entry| entry.value().clone()),
+                );
+                if let Err(panic) = coordinator_result {
+                    std::panic::resume_unwind(panic);
                 }
-
-                // There are several code-path reaching here out of the preceding unconditional
-                // `loop { ... }` by the use of `break 'nonaborted_main_loop;`. This scheduler
-                // thread will now initiate the termination process, indicating an abnormal abortion,
-                // in order to be handled gracefully by other threads.
-
-                // Firstly, send result_with_timings as-is, because it's expected for us to put the
-                // last result_with_timings into the channel without exception. Usually,
-                // result_with_timings will contain the Err variant at this point, indicating the
-                // occurrence of transaction error.
-                session_result_sender
-                    .send(SessionResult {
-                        result_with_timings,
-                        handler_panicked,
-                    })
-                    .expect("always outlived receiver");
-
-                // Next, drop `new_task_receiver`. After that, the paired singleton
-                // `new_task_sender` will start to error when called by external threads, resulting
-                // in propagation of thread abortion to the external threads.
-                drop(new_task_receiver);
-
-                // We will now exit this thread finally... Good bye.
-                sleepless_testing::at(CheckPoint::SchedulerThreadAborted);
             }
         };
 
         let handler_main_loop = || {
+            let lifetime = handler_lifetime.clone();
             let handler_context = handler_context.clone();
             let mut runnable_task_receiver = runnable_task_receiver.clone();
             let finished_blocked_task_sender = finished_blocked_task_sender.clone();
@@ -1584,6 +1613,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             //    `select_biased!`, which are sent from `.send_chained_channel()` in the scheduler
             //    thread for all-but-initial sessions.
             move || {
+                let _lifetime = lifetime;
                 loop {
                     let (task, sender) = select_biased! {
                         recv(runnable_task_receiver.for_select()) -> message => {
@@ -1658,6 +1688,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                     // Retain and join every successfully started worker before
                     // propagating a partial-start failure.
                     drop(runnable_task_receiver);
+                    drop(handler_lifetime);
                     let _ = self.disconnect_new_task_sender();
                     self.ensure_join_threads(true);
                     let _ = self.take_session_result_with_timings();
@@ -1904,6 +1935,7 @@ impl<TH: TaskHandler> SpawnableScheduler<TH> for PooledScheduler<TH> {
             result_with_timings,
             handler_context,
             handler_count,
+            usage_queue_loader.usage_queue_loader().usage_queues.clone(),
         );
         let inner = Self::Inner {
             thread_manager,

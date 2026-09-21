@@ -70,17 +70,16 @@ impl<H: ReplaySessionHandler> ReplaySession<H> {
         handler_count: usize,
     ) -> Self {
         let mut manager = ThreadManager::new(id);
+        let queues = UsageQueueLoader::new_verification();
         manager.start_threads(
             context,
             initialized_result_with_timings(),
             services,
             handler_count,
+            queues.usage_queue_loader().usage_queues.clone(),
         );
         Self {
-            workers: Some(IdleReplaySession {
-                manager,
-                queues: UsageQueueLoader::new_verification(),
-            }),
+            workers: Some(IdleReplaySession { manager, queues }),
         }
     }
 
@@ -159,12 +158,8 @@ impl<H: ReplaySessionHandler> IdleReplaySession<H> {
         let UsageQueueLoader::OwnedBySelf {
             usage_queue_loader_inner,
         } = &mut self.queues;
-        let capacity = usage_queue_loader_inner.fifo_initial_capacity;
-        self.queues = UsageQueueLoader::new_verification();
-        let UsageQueueLoader::OwnedBySelf {
-            usage_queue_loader_inner,
-        } = &mut self.queues;
-        usage_queue_loader_inner.fifo_initial_capacity = capacity;
+        usage_queue_loader_inner.usage_queues.clear();
+        usage_queue_loader_inner.usage_queues.shrink_to_fit();
     }
     pub fn id(&self) -> SchedulerId {
         self.manager.scheduler_id

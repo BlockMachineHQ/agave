@@ -1064,6 +1064,24 @@ pub struct SchedulingStateMachine {
 const_assert_eq!(mem::size_of::<SchedulingStateMachine>(), 128);
 
 impl SchedulingStateMachine {
+    /// Retire an aborted scheduling domain after all handlers have stopped.
+    /// Blocked tasks and usage queues own each other through Arc; merely dropping
+    /// the queue map leaves cycles. Only the coordinator's unique native token
+    /// may clear these cells. Consuming the machine prohibits later descheduling.
+    pub fn retire_queues_after_worker_join(mut self, queues: impl IntoIterator<Item = UsageQueue>) {
+        self.unblocked_task_queue.clear();
+        for queue in queues {
+            queue
+                .0
+                .with_borrow_mut(&mut self.usage_queue_token, |inner| {
+                    *inner = match inner {
+                        UsageQueueInner::Fifo { .. } => UsageQueueInner::with_fifo(0),
+                        UsageQueueInner::Priority { .. } => UsageQueueInner::with_priority(),
+                    };
+                });
+        }
+    }
+
     pub fn has_no_running_task(&self) -> bool {
         self.running_task_count.is_zero()
     }
