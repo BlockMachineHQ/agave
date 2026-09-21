@@ -58,8 +58,10 @@ use {
     unwrap_none::UnwrapNone,
 };
 
+pub mod replay_session;
 mod sleepless_testing;
 use crate::sleepless_testing::BuilderTracked;
+use replay_session::{ReplaySessionContext, ReplaySessionHandler};
 
 // dead_code is false positive; these tuple fields are used via Debug.
 #[allow(dead_code)]
@@ -135,13 +137,7 @@ pub struct HandlerContext {
 
 impl HandlerContext {
     fn usage_queue_loader_for_newly_spawned(&self) -> UsageQueueLoader {
-        UsageQueueLoader::OwnedBySelf {
-            usage_queue_loader_inner: UsageQueueLoaderInner::new(Capability::FifoQueueing),
-        }
-    }
-
-    fn clone_for_scheduler_thread(&self) -> Self {
-        self.clone()
+        UsageQueueLoader::new_verification()
     }
 }
 
@@ -550,6 +546,32 @@ pub trait TaskHandler: Send + Sync + Debug + Sized + 'static {
     );
 }
 
+/// Keep the Bank-specific public handler interface at the production boundary.
+/// The worker/session engine below only sees the associated opaque contexts.
+#[derive(Debug)]
+struct BankTaskHandler<TH: TaskHandler>(PhantomData<TH>);
+
+impl ReplaySessionContext for SchedulingContext {
+    fn slot(&self) -> Slot {
+        self.slot()
+    }
+}
+
+impl<TH: TaskHandler> ReplaySessionHandler for BankTaskHandler<TH> {
+    type Context = SchedulingContext;
+    type Services = HandlerContext;
+
+    fn handle(
+        result: &mut Result<()>,
+        timings: &mut ExecuteTimings,
+        context: &Self::Context,
+        task: &Task,
+        services: &Self::Services,
+    ) {
+        TH::handle(result, timings, context, task, services);
+    }
+}
+
 #[derive(Debug)]
 pub struct DefaultTaskHandler;
 
@@ -624,8 +646,8 @@ enum SubchanneledPayload<P1, P2> {
     Disconnect,
 }
 
-type NewTaskPayload = SubchanneledPayload<Task, Box<(SchedulingContext, ResultWithTimings)>>;
-const_assert_eq!(mem::size_of::<NewTaskPayload>(), 16);
+type NewTaskPayload<C> = SubchanneledPayload<Task, Box<(C, ResultWithTimings)>>;
+const_assert_eq!(mem::size_of::<NewTaskPayload<SchedulingContext>>(), 16);
 
 // A tiny generic message type to synchronize multiple threads everytime some contextual data needs
 // to be switched (ie. SchedulingContext), just using a single communication channel.
@@ -826,6 +848,20 @@ enum UsageQueueLoader {
 }
 
 impl UsageQueueLoader {
+    fn new_verification() -> Self {
+        Self::OwnedBySelf {
+            usage_queue_loader_inner: UsageQueueLoaderInner::new(Capability::FifoQueueing),
+        }
+    }
+
+    fn create_task(
+        &self,
+        transaction: RuntimeTransaction<SanitizedTransaction>,
+        task_id: OrderedTaskId,
+    ) -> Task {
+        SchedulingStateMachine::create_task(transaction, task_id, &mut |key| self.load(key))
+    }
+
     fn usage_queue_loader(&self) -> &UsageQueueLoaderInner {
         match self {
             Self::OwnedBySelf {
@@ -934,15 +970,12 @@ pub struct PooledScheduler<TH: TaskHandler> {
 
 #[derive(Debug)]
 pub struct PooledSchedulerInner<S: SpawnableScheduler<TH>, TH: TaskHandler> {
-    thread_manager: ThreadManager<S, TH>,
+    thread_manager: ThreadManager<BankTaskHandler<TH>>,
     usage_queue_loader: UsageQueueLoader,
+    pool: Arc<SchedulerPool<S, TH>>,
 }
 
-impl<S, TH> Drop for ThreadManager<S, TH>
-where
-    S: SpawnableScheduler<TH>,
-    TH: TaskHandler,
-{
+impl<H: ReplaySessionHandler> Drop for ThreadManager<H> {
     fn drop(&mut self) {
         trace!("ThreadManager::drop() is called...");
 
@@ -1012,11 +1045,10 @@ where
 // here to mean some continuous time over multiple continuous banks/slots for the block production,
 // which is planned to be implemented in the future.
 #[derive(Debug)]
-struct ThreadManager<S: SpawnableScheduler<TH>, TH: TaskHandler> {
+struct ThreadManager<H: ReplaySessionHandler> {
     scheduler_id: SchedulerId,
-    pool: Arc<SchedulerPool<S, TH>>,
-    new_task_sender: Sender<NewTaskPayload>,
-    new_task_receiver: Option<Receiver<NewTaskPayload>>,
+    new_task_sender: Sender<NewTaskPayload<H::Context>>,
+    new_task_receiver: Option<Receiver<NewTaskPayload<H::Context>>>,
     session_result_sender: Sender<ResultWithTimings>,
     session_result_receiver: Receiver<ResultWithTimings>,
     session_result_with_timings: Option<ResultWithTimings>,
@@ -1027,14 +1059,13 @@ struct ThreadManager<S: SpawnableScheduler<TH>, TH: TaskHandler> {
 struct HandlerPanicked;
 type HandlerResult = std::result::Result<Box<ExecutedTask>, HandlerPanicked>;
 
-impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
-    fn new(pool: Arc<SchedulerPool<S, TH>>) -> Self {
+impl<H: ReplaySessionHandler> ThreadManager<H> {
+    fn new(scheduler_id: SchedulerId) -> Self {
         let (new_task_sender, new_task_receiver) = crossbeam_channel::unbounded();
         let (session_result_sender, session_result_receiver) = crossbeam_channel::unbounded();
 
         Self {
-            scheduler_id: pool.new_scheduler_id(),
-            pool,
+            scheduler_id,
             new_task_sender,
             new_task_receiver: Some(new_task_receiver),
             session_result_sender,
@@ -1046,12 +1077,12 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
     }
 
     fn execute_task_with_handler(
-        scheduling_context: &SchedulingContext,
+        scheduling_context: &H::Context,
         executed_task: &mut Box<ExecutedTask>,
-        handler_context: &HandlerContext,
+        handler_context: &H::Services,
     ) {
         debug!("handling task at {:?}", thread::current());
-        TH::handle(
+        H::handle(
             &mut executed_task.result_with_timings.0,
             &mut executed_task.result_with_timings.1,
             scheduling_context,
@@ -1145,10 +1176,12 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
     // for type safety.
     fn start_threads(
         &mut self,
-        context: SchedulingContext,
+        context: H::Context,
         mut result_with_timings: ResultWithTimings,
-        handler_context: HandlerContext,
+        handler_context: H::Services,
+        handler_count: usize,
     ) {
+        assert!(handler_count >= 1);
         let mut current_slot = context.slot();
         let (mut is_finished, mut session_ending) = (false, false);
 
@@ -1229,7 +1262,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         // prioritization further. Consequently, this also contributes to alleviate the known
         // heuristic's caveat for the first task of linearized runs, which is described above.
         let (mut runnable_task_sender, runnable_task_receiver) =
-            chained_channel::unbounded::<Task, SchedulingContext>(context);
+            chained_channel::unbounded::<Task, H::Context>(context);
         // Create two handler-to-scheduler channels to prioritize the finishing of blocked tasks,
         // because it is more likely that a blocked task will have more blocked tasks behind it,
         // which should be scheduled while minimizing the delay to clear buffered linearized runs
@@ -1249,7 +1282,9 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         // 5. the handler thread reply back to the scheduler thread as an executed task.
         // 6. the scheduler thread post-processes the executed task.
         let scheduler_main_loop = {
-            let handler_context = handler_context.clone_for_scheduler_thread();
+            // Preserve the production service lifetime even though scheduling
+            // only needs handler_count, not access to execution services.
+            let scheduler_services = handler_context.clone();
             let session_result_sender = self.session_result_sender.clone();
             // Taking new_task_receiver here is important to ensure there's a single receiver. In
             // this way, the replay stage will get .send() failures reliably, after this scheduler
@@ -1298,6 +1333,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             // like syscalls, VDSO, and even memory (de)allocation should be avoided at all costs
             // by design or by means of offloading at the last resort.
             move || {
+                let _services = scheduler_services;
                 let (do_now, dont_now) = (&disconnected::<()>(), &never::<()>());
                 let dummy_receiver = |trigger| {
                     if trigger { do_now } else { dont_now }
@@ -1463,10 +1499,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                                 // Before that, propagate new SchedulingContext to handler threads
                                 current_slot = new_context.slot();
                                 runnable_task_sender
-                                    .send_chained_channel(
-                                        &new_context,
-                                        handler_context.thread_count,
-                                    )
+                                    .send_chained_channel(&new_context, handler_count)
                                     .unwrap();
 
                                 break;
@@ -1591,7 +1624,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                 .unwrap(),
         );
 
-        self.handler_threads = (0..handler_context.thread_count)
+        self.handler_threads = (0..handler_count)
             .map({
                 |thx| {
                     thread::Builder::new()
@@ -1729,11 +1762,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             .unwrap();
     }
 
-    fn start_session(
-        &mut self,
-        context: SchedulingContext,
-        result_with_timings: ResultWithTimings,
-    ) {
+    fn start_session(&mut self, context: H::Context, result_with_timings: ResultWithTimings) {
         assert!(!self.are_threads_joined());
         assert_matches!(self.session_result_with_timings, None);
         self.new_task_sender
@@ -1816,13 +1845,20 @@ impl<TH: TaskHandler> SpawnableScheduler<TH> for PooledScheduler<TH> {
         context: SchedulingContext,
         result_with_timings: ResultWithTimings,
     ) -> Self {
-        let mut thread_manager = ThreadManager::new(pool.clone());
+        let mut thread_manager = ThreadManager::new(pool.new_scheduler_id());
         let handler_context = pool.create_handler_context();
         let usage_queue_loader = handler_context.usage_queue_loader_for_newly_spawned();
-        thread_manager.start_threads(context.clone(), result_with_timings, handler_context);
+        let handler_count = handler_context.thread_count;
+        thread_manager.start_threads(
+            context.clone(),
+            result_with_timings,
+            handler_context,
+            handler_count,
+        );
         let inner = Self::Inner {
             thread_manager,
             usage_queue_loader,
+            pool,
         };
         Self { inner, context }
     }
@@ -1842,9 +1878,10 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
         transaction: RuntimeTransaction<SanitizedTransaction>,
         task_id: OrderedTaskId,
     ) -> ScheduleResult {
-        let task = SchedulingStateMachine::create_task(transaction, task_id, &mut |pubkey| {
-            self.inner.usage_queue_loader.load(pubkey)
-        });
+        let task = self
+            .inner
+            .usage_queue_loader
+            .create_task(transaction, task_id);
         self.inner.thread_manager.send_task(task)
     }
 
@@ -1886,7 +1923,7 @@ where
 
     fn is_overgrown(&self) -> bool {
         self.usage_queue_loader
-            .is_overgrown(self.thread_manager.pool.max_usage_queue_count)
+            .is_overgrown(self.pool.max_usage_queue_count)
     }
 
     fn discard_buffer(&self) {
@@ -1900,7 +1937,7 @@ where
     TH: TaskHandler,
 {
     fn return_to_pool(self: Box<Self>) {
-        self.thread_manager.pool.clone().return_scheduler(*self);
+        self.pool.clone().return_scheduler(*self);
     }
 }
 
