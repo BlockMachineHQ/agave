@@ -452,10 +452,22 @@ pub fn recover_scheduler_error<S: Debug, P: Debug>(
     status: &RwLock<SchedulerStatus<S, P>>,
     recover: impl FnOnce(&mut S) -> TransactionError,
 ) -> TransactionError {
+    recover_scheduler_error_with(status, |error| error, recover)
+}
+
+/// Preserve protocol errors while allowing an execution adapter to return its
+/// distinct infrastructure-failure channel after quiescence.
+pub fn recover_scheduler_error_with<S: Debug, P: Debug, R>(
+    status: &RwLock<SchedulerStatus<S, P>>,
+    protocol_error: impl FnOnce(TransactionError) -> R,
+    recover: impl FnOnce(&mut S) -> R,
+) -> R {
     let mut scheduler = status.write().unwrap();
     match &mut *scheduler {
         SchedulerStatus::Active(active) => recover(active),
-        SchedulerStatus::Stale(_, (result, _)) if result.is_err() => result.clone().unwrap_err(),
+        SchedulerStatus::Stale(_, (result, _)) if result.is_err() => {
+            protocol_error(result.clone().unwrap_err())
+        }
         _ => unreachable!("no scheduler error"),
     }
 }

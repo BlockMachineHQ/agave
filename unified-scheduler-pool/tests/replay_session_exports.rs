@@ -12,7 +12,7 @@ use {
     solana_transaction_error::{TransactionError, TransactionResult},
     solana_unified_scheduler_logic::Task,
     solana_unified_scheduler_pool::replay_session::{
-        ReplaySession, ReplaySessionContext, ReplaySessionHandler,
+        ExecutionFault, ReplaySession, ReplaySessionContext, ReplaySessionHandler,
     },
     std::{
         collections::HashSet,
@@ -34,6 +34,7 @@ struct Context {
     generation: u64,
     state: Arc<State>,
     fail_after_commit: Option<u128>,
+    backend_fault: bool,
     first_task_gate: Option<(Sender<()>, Receiver<()>)>,
 }
 
@@ -63,7 +64,7 @@ impl ReplaySessionHandler for Handler {
         context: &Context,
         task: &Task,
         threads: &Self::Services,
-    ) {
+    ) -> Result<(), ExecutionFault> {
         threads.lock().unwrap().insert(thread::current().id());
         timings.saturating_add_in_place(ExecuteTimingType::ExecuteUs, 7);
         let id = task.task_id();
@@ -81,6 +82,10 @@ impl ReplaySessionHandler for Handler {
         if context.fail_after_commit == Some(id) {
             *result = Err(TransactionError::WouldExceedMaxBlockCostLimit);
         }
+        if context.backend_fault {
+            return Err(ExecutionFault);
+        }
+        Ok(())
     }
 }
 
@@ -98,6 +103,7 @@ fn context(generation: u64) -> Context {
         generation,
         state: Arc::new(State::default()),
         fail_after_commit: None,
+        backend_fault: false,
         first_task_gate: None,
     }
 }
@@ -234,7 +240,7 @@ impl ReplaySessionHandler for PanicHandler {
         _context: &Context,
         _task: &Task,
         services: &PanicServices,
-    ) {
+    ) -> Result<(), ExecutionFault> {
         services.started.send(()).unwrap();
         if thread::current().name().unwrap().ends_with("00") {
             services.release_panic.recv_timeout(WAIT).unwrap();
@@ -242,6 +248,7 @@ impl ReplaySessionHandler for PanicHandler {
         }
         services.release_slow.recv_timeout(WAIT).unwrap();
         services.slow_finished.send(()).unwrap();
+        Ok(())
     }
 }
 
@@ -309,6 +316,22 @@ fn scheduler_panic_disconnects_completion_waiter() {
     });
     assert!(done_rx.recv_timeout(WAIT).unwrap());
     join.join().unwrap();
+}
+
+#[test]
+fn backend_fault_is_a_quiescent_result_without_unwinding() {
+    let mut context = context(0);
+    context.backend_fault = true;
+    let state = context.state.clone();
+    let session =
+        ReplaySession::<Handler>::new(24, context, Arc::new(Mutex::new(HashSet::new())), 1);
+    session
+        .schedule_execution(transaction(&Keypair::new(), 0), 0)
+        .unwrap();
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.finish_outcome()));
+    assert!(matches!(outcome, Ok(Err(ExecutionFault))));
+    assert_eq!(*state.commits.lock().unwrap(), [(0, 0)]);
 }
 
 #[test]

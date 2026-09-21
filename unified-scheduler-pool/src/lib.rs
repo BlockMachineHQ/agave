@@ -61,7 +61,7 @@ use {
 pub mod replay_session;
 mod sleepless_testing;
 use crate::sleepless_testing::BuilderTracked;
-use replay_session::{ReplaySessionContext, ReplaySessionHandler};
+use replay_session::{ExecutionFault, ReplaySessionContext, ReplaySessionHandler};
 
 // dead_code is false positive; these tuple fields are used via Debug.
 #[allow(dead_code)]
@@ -567,8 +567,9 @@ impl<TH: TaskHandler> ReplaySessionHandler for BankTaskHandler<TH> {
         context: &Self::Context,
         task: &Task,
         services: &Self::Services,
-    ) {
+    ) -> std::result::Result<(), ExecutionFault> {
         TH::handle(result, timings, context, task, services);
+        Ok(())
     }
 }
 
@@ -616,6 +617,7 @@ impl TaskHandler for DefaultTaskHandler {
 struct ExecutedTask {
     task: Task,
     result_with_timings: ResultWithTimings,
+    execution_fault: bool,
 }
 
 impl ExecutedTask {
@@ -623,6 +625,7 @@ impl ExecutedTask {
         Box::new(Self {
             task,
             result_with_timings: initialized_result_with_timings(),
+            execution_fault: false,
         })
     }
 
@@ -1057,6 +1060,7 @@ struct ThreadManager<H: ReplaySessionHandler> {
     session_result_sender: Option<Sender<SessionResult>>,
     session_result_receiver: Receiver<SessionResult>,
     session_result_with_timings: Option<ResultWithTimings>,
+    execution_fault: bool,
     scheduler_thread: Option<JoinHandle<()>>,
     handler_threads: Vec<JoinHandle<()>>,
 }
@@ -1067,6 +1071,7 @@ type HandlerResult = std::result::Result<Box<ExecutedTask>, HandlerPanicked>;
 struct SessionResult {
     result_with_timings: ResultWithTimings,
     handler_panicked: bool,
+    execution_fault: bool,
 }
 
 impl<H: ReplaySessionHandler> ThreadManager<H> {
@@ -1081,6 +1086,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             session_result_sender: Some(session_result_sender),
             session_result_receiver,
             session_result_with_timings: None,
+            execution_fault: false,
             scheduler_thread: None,
             handler_threads: vec![],
         }
@@ -1092,13 +1098,14 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
         handler_context: &H::Services,
     ) {
         debug!("handling task at {:?}", thread::current());
-        H::handle(
+        executed_task.execution_fault = H::handle(
             &mut executed_task.result_with_timings.0,
             &mut executed_task.result_with_timings.1,
             scheduling_context,
             &executed_task.task,
             handler_context,
-        );
+        )
+        .is_err();
     }
 
     fn max_running_task_count() -> Option<usize> {
@@ -1137,12 +1144,17 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
     fn abort_or_accumulate_result_with_timings(
         (result, timings): &mut ResultWithTimings,
         executed_task: Box<ExecutedTask>,
+        execution_fault: &mut bool,
     ) -> bool {
         sleepless_testing::at(CheckPoint::TaskAccumulated(
             executed_task.task.task_id(),
             &executed_task.result_with_timings.0,
         ));
         timings.accumulate(&executed_task.result_with_timings.1);
+        if executed_task.execution_fault {
+            *execution_fault = true;
+            return true;
+        }
 
         match executed_task.result_with_timings.0 {
             Ok(()) => {
@@ -1351,6 +1363,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             move || {
                 let _services = scheduler_services;
                 let mut handler_panicked = false;
+                let mut execution_fault = false;
                 let (do_now, dont_now) = (&disconnected::<()>(), &never::<()>());
                 let dummy_receiver = |trigger| {
                     if trigger { do_now } else { dont_now }
@@ -1403,6 +1416,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                                         if Self::abort_or_accumulate_result_with_timings(
                                             &mut result_with_timings,
                                             executed_task,
+                                            &mut execution_fault,
                                         ) {
                                             break 'nonaborted_main_loop;
                                         }
@@ -1465,6 +1479,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                                         if Self::abort_or_accumulate_result_with_timings(
                                             &mut result_with_timings,
                                             executed_task,
+                                            &mut execution_fault,
                                         ) {
                                             break 'nonaborted_main_loop;
                                         }
@@ -1483,6 +1498,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                                 .send(SessionResult {
                                     result_with_timings,
                                     handler_panicked: false,
+                                    execution_fault: false,
                                 })
                                 .expect("always outlived receiver");
 
@@ -1568,6 +1584,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                             .send(SessionResult {
                                 result_with_timings,
                                 handler_panicked,
+                                execution_fault,
                             })
                             .expect("always outlived receiver");
 
@@ -1747,6 +1764,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                     "handler panic without failed join"
                 );
                 let result_with_timings = session_result.result_with_timings;
+                self.execution_fault = session_result.execution_fault;
                 debug!("ensure_join_threads(): err: {:?}", result_with_timings.0);
                 self.put_session_result_with_timings(result_with_timings);
             }
@@ -1816,7 +1834,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
         }
 
         if abort_detected {
-            self.ensure_join_threads_after_abort(true);
+            self.ensure_join_threads(true);
             return;
         }
 
@@ -1828,11 +1846,13 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             self.ensure_join_threads(false);
             panic!("replay scheduler exited without a session result");
         };
-        abort_detected =
-            session_result.handler_panicked || session_result.result_with_timings.0.is_err();
+        abort_detected = session_result.handler_panicked
+            || session_result.execution_fault
+            || session_result.result_with_timings.0.is_err();
+        self.execution_fault = session_result.execution_fault;
         self.put_session_result_with_timings(session_result.result_with_timings);
         if abort_detected {
-            self.ensure_join_threads_after_abort(false);
+            self.ensure_join_threads(false);
         }
         debug!("end_session(): ended session at {:?}...", thread::current());
     }

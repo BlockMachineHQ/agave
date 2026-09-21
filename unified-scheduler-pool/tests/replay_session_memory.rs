@@ -11,7 +11,7 @@ use {
     solana_transaction_error::TransactionResult,
     solana_unified_scheduler_logic::Task,
     solana_unified_scheduler_pool::replay_session::{
-        ReplaySession, ReplaySessionContext, ReplaySessionHandler,
+        ExecutionFault, ReplaySession, ReplaySessionContext, ReplaySessionHandler,
     },
     std::{
         alloc::{GlobalAlloc, Layout, System},
@@ -67,6 +67,7 @@ struct Context {
     completed: Arc<AtomicUsize>,
     fail: bool,
     panic: bool,
+    backend_fault: bool,
 }
 impl ReplaySessionContext for Context {
     fn slot(&self) -> Slot {
@@ -84,15 +85,19 @@ impl ReplaySessionHandler for Handler {
         context: &Context,
         task: &Task,
         _services: &(),
-    ) {
+    ) -> Result<(), ExecutionFault> {
         if task.task_id() == 0 {
             context.gate.wait();
         }
         context.completed.fetch_add(1, Ordering::SeqCst);
         assert!(!context.panic, "controlled resource-fixture panic");
+        if context.backend_fault {
+            return Err(ExecutionFault);
+        }
         if context.fail {
             *result = Err(solana_transaction_error::TransactionError::AccountNotFound);
         }
+        Ok(())
     }
 }
 
@@ -116,6 +121,7 @@ fn stalled_dependency_queue_heap_fits_reserved_metadata_envelope() {
                 completed: Arc::new(AtomicUsize::new(0)),
                 fail: false,
                 panic: false,
+                backend_fault: false,
             };
             let base = LIVE.load(Ordering::SeqCst);
             PEAK.store(base, Ordering::SeqCst);
@@ -146,7 +152,7 @@ fn stalled_dependency_queue_heap_fits_reserved_metadata_envelope() {
             );
         }
     }
-    for panicking in [false, true] {
+    for (panicking, backend_fault) in [(false, false), (true, false), (false, true)] {
         let base = LIVE.load(Ordering::SeqCst);
         for _ in 0..16 {
             let payer = Keypair::new();
@@ -155,6 +161,7 @@ fn stalled_dependency_queue_heap_fits_reserved_metadata_envelope() {
                 completed: Arc::new(AtomicUsize::new(0)),
                 fail: true,
                 panic: panicking,
+                backend_fault,
             };
             let session = ReplaySession::<Handler>::new(2, context.clone(), (), 2)
                 .with_fifo_initial_capacity(0);
@@ -169,17 +176,21 @@ fn stalled_dependency_queue_heap_fits_reserved_metadata_envelope() {
             }
             context.gate.wait();
             let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.finish()));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.finish_outcome()));
             if panicking {
                 assert!(outcome.is_err());
+            } else if backend_fault {
+                assert!(matches!(outcome, Ok(Err(ExecutionFault))));
             } else {
-                let (result, idle) = outcome.unwrap();
+                let (result, idle) = outcome.unwrap().unwrap();
                 assert!(result.0.is_err());
                 assert!(idle.is_none());
             }
         }
         let retained = LIVE.load(Ordering::SeqCst).saturating_sub(base);
-        println!("session_abort_heap attempts=16 panicking={panicking} retained_delta={retained}");
+        println!(
+            "session_abort_heap attempts=16 panicking={panicking} backend_fault={backend_fault} retained_delta={retained}"
+        );
         assert!(
             retained < 65536,
             "aborted sessions retained task/usage-queue ownership"

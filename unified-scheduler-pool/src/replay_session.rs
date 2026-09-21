@@ -28,6 +28,12 @@ pub trait ReplaySessionContext: Clone + Debug + Send + Sync + 'static {
     fn slot(&self) -> Slot;
 }
 
+/// A non-protocol execution-service failure. The adapter retains its concrete
+/// error/evidence; this signal aborts and retires a session without invoking the
+/// process panic hook or inventing a TransactionError.
+#[derive(Debug)]
+pub struct ExecutionFault;
+
 pub trait ReplaySessionHandler: Debug + Send + Sync + 'static {
     type Context: ReplaySessionContext;
     type Services: Clone + Debug + Send + Sync + 'static;
@@ -38,7 +44,7 @@ pub trait ReplaySessionHandler: Debug + Send + Sync + 'static {
         context: &Self::Context,
         task: &Task,
         services: &Self::Services,
-    );
+    ) -> Result<(), ExecutionFault>;
 
     /// Observational notification after result delivery, including fatal handler
     /// notification. Implementations must not panic or access mutable bank state.
@@ -93,12 +99,22 @@ impl<H: ReplaySessionHandler> ReplaySession<H> {
         workers.manager.send_task(task)
     }
 
-    pub fn recover_error_after_abort(&mut self) -> solana_transaction_error::TransactionError {
-        self.workers
-            .as_mut()
-            .unwrap()
-            .manager
-            .ensure_join_threads_after_abort(true)
+    pub fn recover_error_after_abort(
+        &mut self,
+    ) -> Result<solana_transaction_error::TransactionError, ExecutionFault> {
+        let manager = &mut self.workers.as_mut().unwrap().manager;
+        manager.ensure_join_threads(true);
+        if manager.execution_fault {
+            Err(ExecutionFault)
+        } else {
+            Ok(manager
+                .session_result_with_timings
+                .as_ref()
+                .unwrap()
+                .0
+                .clone()
+                .unwrap_err())
+        }
     }
 
     pub fn pause_for_recent_blockhash(&mut self) {
@@ -118,12 +134,24 @@ impl<H: ReplaySessionHandler> ReplaySession<H> {
     /// Uses the production end-session path, including abort joins. A successful
     /// result follows native reuse rules; a transaction error retires the workers.
     /// Handler panics propagate after every worker has joined.
-    pub fn finish(mut self) -> (ResultWithTimings, Option<IdleReplaySession<H>>) {
+    pub fn finish(self) -> (ResultWithTimings, Option<IdleReplaySession<H>>) {
+        self.finish_outcome().expect("execution backend failed")
+    }
+
+    /// Complete with a distinct, non-panicking infrastructure-failure outcome.
+    pub fn finish_outcome(
+        mut self,
+    ) -> Result<(ResultWithTimings, Option<IdleReplaySession<H>>), ExecutionFault> {
         let mut workers = self.workers.take().unwrap();
         workers.manager.end_session();
         let result = workers.manager.take_session_result_with_timings();
         let reusable = !workers.manager.are_threads_joined();
-        (result, reusable.then_some(workers))
+        if workers.manager.execution_fault {
+            assert!(!reusable);
+            Err(ExecutionFault)
+        } else {
+            Ok((result, reusable.then_some(workers)))
+        }
     }
 }
 
