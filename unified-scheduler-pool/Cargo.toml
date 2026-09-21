@@ -45,12 +45,14 @@ static_assertions = { workspace = true }
 unwrap_none = { workspace = true }
 
 [dev-dependencies]
+solana-account = { workspace = true }
 agave-logger = { path = "../logger", features = ["agave-unstable-api"] }
 assert_matches = { workspace = true }
 solana-clock = { workspace = true }
 solana-entry = { path = "../entry", features = ["agave-unstable-api"] }
 solana-hash = { workspace = true }
 solana-keypair = { workspace = true }
+solana-signer = { workspace = true }
 solana-runtime = { path = "../runtime", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-system-transaction = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`

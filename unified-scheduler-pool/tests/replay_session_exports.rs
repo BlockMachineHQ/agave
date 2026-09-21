@@ -6,7 +6,7 @@ use {
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-    solana_svm_timings::ExecuteTimings,
+    solana_svm_timings::{ExecuteTimingType, ExecuteTimings},
     solana_system_transaction::transfer,
     solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_error::{TransactionError, TransactionResult},
@@ -39,6 +39,11 @@ struct Context {
 
 impl ReplaySessionContext for Context {
     fn slot(&self) -> Slot {
+        assert_ne!(
+            self.generation,
+            u64::MAX,
+            "controlled scheduler context panic"
+        );
         // Deliberately identical slots: the engine must propagate actual context,
         // not derive execution identity from the diagnostic slot number.
         42
@@ -54,12 +59,13 @@ impl ReplaySessionHandler for Handler {
 
     fn handle(
         result: &mut TransactionResult<()>,
-        _timings: &mut ExecuteTimings,
+        timings: &mut ExecuteTimings,
         context: &Context,
         task: &Task,
         threads: &Self::Services,
     ) {
         threads.lock().unwrap().insert(thread::current().id());
+        timings.saturating_add_in_place(ExecuteTimingType::ExecuteUs, 7);
         let id = task.task_id();
         if id == 0
             && let Some((started, release)) = &context.first_task_gate
@@ -239,15 +245,17 @@ impl ReplaySessionHandler for PanicHandler {
     }
 }
 
-/// Characterize the unchanged native failure path, not an acceptance test for
-/// BM restoration: a caught native panic is insufficient proof of quiescence.
+/// A fatal handler outcome must neither masquerade as success nor escape the
+/// completion barrier while another handler still has access to session state.
 #[test]
-fn native_panic_propagation_is_not_a_quiescence_barrier() {
+fn native_panic_propagation_waits_for_all_handlers() {
     let (started_tx, started_rx) = bounded(2);
     let (panic_tx, panic_rx) = bounded(1);
     let (slow_tx, slow_rx) = bounded(1);
     let (slow_finished_tx, slow_finished_rx) = bounded(1);
     let (finished_tx, finished_rx) = bounded(1);
+    let returned_success = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let returned_success_in_worker = returned_success.clone();
     let session = ReplaySession::<PanicHandler>::new(
         21,
         context(0),
@@ -270,19 +278,103 @@ fn native_panic_propagation_is_not_a_quiescence_barrier() {
     started_rx.recv_timeout(WAIT).unwrap();
     let join = thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Native completion can race panic detection and return an idle
-            // candidate first. Include its retirement inside the catch boundary.
-            drop(session.finish());
+            let result = session.finish();
+            returned_success_in_worker.store(true, std::sync::atomic::Ordering::Release);
+            drop(result);
         }));
         finished_tx.send(result.is_err()).unwrap();
     });
     panic_tx.send(()).unwrap();
-    let propagated = finished_rx.recv_timeout(WAIT);
-    let still_executing = slow_finished_rx.try_recv().is_err();
-    // Always release the other worker before asserting the diagnostic result.
+    let premature = finished_rx.recv_timeout(Duration::from_millis(50));
     slow_tx.send(()).unwrap();
     slow_finished_rx.recv_timeout(WAIT).unwrap();
+    let propagated = finished_rx.recv_timeout(WAIT);
     join.join().unwrap();
+    assert!(premature.is_err());
     assert!(propagated.unwrap());
-    assert!(still_executing);
+    assert!(!returned_success.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn scheduler_panic_disconnects_completion_waiter() {
+    let session =
+        ReplaySession::<Handler>::new(22, context(0), Arc::new(Mutex::new(HashSet::new())), 2);
+    let (result, idle) = session.finish();
+    result.0.unwrap();
+    let session = idle.unwrap().resume(context(u64::MAX));
+    let (done_tx, done_rx) = bounded(1);
+    let join = thread::spawn(move || {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.finish()));
+        done_tx.send(failed.is_err()).unwrap();
+    });
+    assert!(done_rx.recv_timeout(WAIT).unwrap());
+    join.join().unwrap();
+}
+
+#[test]
+fn shared_attachment_reclaims_resumes_and_pauses_with_cumulative_results() {
+    use solana_runtime::installed_scheduler_pool::{
+        SchedulerStatus, finish_scheduler_attachment, reclaim_scheduler_attachment,
+        with_active_scheduler,
+    };
+    let context = context(0);
+    let payer = Keypair::new();
+    let session =
+        ReplaySession::<Handler>::new(23, context.clone(), Arc::new(Mutex::new(HashSet::new())), 2);
+    let pool = Arc::new(Mutex::new(None));
+    let attachment = std::sync::RwLock::new(SchedulerStatus::new(Some(session)));
+    with_active_scheduler(
+        &attachment,
+        |_, _| unreachable!(),
+        |_| {},
+        |session| session.schedule_execution(transaction(&payer, 0), 0),
+    )
+    .unwrap();
+    reclaim_scheduler_attachment(&attachment, |session| {
+        let (result, idle) = session.finish();
+        *pool.lock().unwrap() = idle;
+        (pool.clone(), result)
+    });
+    assert!(matches!(
+        *attachment.read().unwrap(),
+        SchedulerStatus::Stale(_, _)
+    ));
+    with_active_scheduler(
+        &attachment,
+        |pool, result| {
+            pool.lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .resume_with_result(context.clone(), result)
+        },
+        |_| {},
+        |session| session.schedule_execution(transaction(&payer, 1), 1),
+    )
+    .unwrap();
+    let (_, result) = finish_scheduler_attachment(
+        &attachment,
+        true,
+        |session| session.pause_for_recent_blockhash(),
+        |_| unreachable!(),
+    );
+    assert!(result.is_none());
+    let (_, result) = finish_scheduler_attachment(
+        &attachment,
+        false,
+        |_| unreachable!(),
+        |session| {
+            let (result, idle) = session.finish();
+            drop(idle);
+            result
+        },
+    );
+    let result = result.unwrap();
+    result.0.unwrap();
+    assert_eq!(result.1.metrics[ExecuteTimingType::ExecuteUs].0, 14);
+    assert_eq!(*context.state.commits.lock().unwrap(), [(0, 0), (0, 1)]);
+    assert!(matches!(
+        *attachment.read().unwrap(),
+        SchedulerStatus::Unavailable
+    ));
 }

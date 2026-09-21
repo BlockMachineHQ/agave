@@ -4,9 +4,8 @@
 //! commit and post-commit checks before returning; the production engine owns
 //! priority, completion/descheduling, error accumulation and context transitions.
 //! This experimental interface does not provide a memory bound or a Bank
-//! lifecycle attachment. It preserves native panic behavior: a session result
-//! can race handler-panic termination, and catching a later join panic is not
-//! a worker-quiescence barrier. Do not use it for recoverable state restoration.
+//! lifecycle attachment. Fatal worker failures propagate only after the shared
+//! engine joins every worker; they never authorize session reuse.
 
 use {
     crate::{ThreadManager, UsageQueueLoader},
@@ -40,6 +39,10 @@ pub trait ReplaySessionHandler: Debug + Send + Sync + 'static {
         task: &Task,
         services: &Self::Services,
     );
+
+    /// Observational notification after result delivery, including fatal handler
+    /// notification. Implementations must not panic or access mutable bank state.
+    fn task_delivered(_context: &Self::Context, _task_id: OrderedTaskId) {}
 }
 
 /// An active verification session on a dedicated native scheduler and handlers.
@@ -50,9 +53,8 @@ pub struct ReplaySession<H: ReplaySessionHandler> {
 }
 
 /// Workers returned by native session completion and their queue cache. Resume
-/// consumes this handle; transaction-error sessions are retired instead. A
-/// native handler panic can race completion, so this handle is not evidence that
-/// no fatal worker fault occurred. Dropping retires the native workers.
+/// consumes this handle; failed sessions are retired instead. Dropping retires
+/// the native workers.
 /// Completion does not release the previous context held by idle handlers.
 #[derive(Debug)]
 pub struct IdleReplaySession<H: ReplaySessionHandler> {
@@ -92,10 +94,31 @@ impl<H: ReplaySessionHandler> ReplaySession<H> {
         workers.manager.send_task(task)
     }
 
+    pub fn recover_error_after_abort(&mut self) -> solana_transaction_error::TransactionError {
+        self.workers
+            .as_mut()
+            .unwrap()
+            .manager
+            .ensure_join_threads_after_abort(true)
+    }
+
+    pub fn pause_for_recent_blockhash(&mut self) {
+        self.workers.as_mut().unwrap().manager.end_session();
+    }
+
+    /// Allocation setting only; must be selected before submitting any task.
+    pub fn with_fifo_initial_capacity(mut self, capacity: usize) -> Self {
+        let UsageQueueLoader::OwnedBySelf {
+            usage_queue_loader_inner,
+        } = &mut self.workers.as_mut().unwrap().queues;
+        assert_eq!(usage_queue_loader_inner.count(), 0);
+        usage_queue_loader_inner.fifo_initial_capacity = Some(capacity);
+        self
+    }
+
     /// Uses the production end-session path, including abort joins. A successful
     /// result follows native reuse rules; a transaction error retires the workers.
-    /// Handler panics propagate when the production path joins workers, which
-    /// can be later than this call if a panic races successful-result delivery.
+    /// Handler panics propagate after every worker has joined.
     pub fn finish(mut self) -> (ResultWithTimings, Option<IdleReplaySession<H>>) {
         let mut workers = self.workers.take().unwrap();
         workers.manager.end_session();
@@ -107,18 +130,42 @@ impl<H: ReplaySessionHandler> ReplaySession<H> {
 
 impl<H: ReplaySessionHandler> Drop for ReplaySession<H> {
     fn drop(&mut self) {
-        // Preserve native unwinding behavior; do not claim a quiescence barrier
-        // when the production engine itself skips joins during unwinding.
-        if !std::thread::panicking()
-            && let Some(workers) = &mut self.workers
-        {
-            workers.manager.end_session();
-            let _ = workers.manager.take_session_result_with_timings();
+        if let Some(workers) = &mut self.workers {
+            let unwinding = std::thread::panicking();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if unwinding {
+                    let _ = workers.manager.disconnect_new_task_sender();
+                    workers.manager.ensure_join_threads(true);
+                } else {
+                    workers.manager.end_session();
+                }
+                let _ = workers.manager.take_session_result_with_timings();
+            }));
+            if let Err(panic) = result {
+                if unwinding {
+                    log::error!("replay worker failed while draining an unwinding session");
+                } else {
+                    std::panic::resume_unwind(panic);
+                }
+            }
         }
     }
 }
 
 impl<H: ReplaySessionHandler> IdleReplaySession<H> {
+    /// Release per-address retained allocations at a completed-session boundary.
+    /// Worker/token ownership stays unchanged; the next session recreates queues.
+    pub fn clear_usage_queues(&mut self) {
+        let UsageQueueLoader::OwnedBySelf {
+            usage_queue_loader_inner,
+        } = &mut self.queues;
+        let capacity = usage_queue_loader_inner.fifo_initial_capacity;
+        self.queues = UsageQueueLoader::new_verification();
+        let UsageQueueLoader::OwnedBySelf {
+            usage_queue_loader_inner,
+        } = &mut self.queues;
+        usage_queue_loader_inner.fifo_initial_capacity = capacity;
+    }
     pub fn id(&self) -> SchedulerId {
         self.manager.scheduler_id
     }
@@ -127,12 +174,17 @@ impl<H: ReplaySessionHandler> IdleReplaySession<H> {
         self.queues.is_overgrown(max_usage_queue_count)
     }
 
-    /// A fresh session; cumulative same-bank resume is deliberately not exposed
-    /// by this initial facade. The production Bank attachment retains its native
-    /// cumulative-result and pause behavior on the same generic engine.
-    pub fn resume(mut self, context: H::Context) -> ReplaySession<H> {
-        self.manager
-            .start_session(context, initialized_result_with_timings());
+    pub fn resume(self, context: H::Context) -> ReplaySession<H> {
+        self.resume_with_result(context, initialized_result_with_timings())
+    }
+
+    pub fn resume_with_result(
+        mut self,
+        context: H::Context,
+        result: ResultWithTimings,
+    ) -> ReplaySession<H> {
+        assert!(result.0.is_ok(), "cannot resume a failed bank");
+        self.manager.start_session(context, result);
         ReplaySession {
             workers: Some(self),
         }

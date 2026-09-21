@@ -813,6 +813,7 @@ mod chained_channel {
 #[derive(Debug)]
 struct UsageQueueLoaderInner {
     capability: Capability,
+    fifo_initial_capacity: Option<usize>,
     usage_queues: DashMap<Pubkey, UsageQueue>,
 }
 
@@ -820,6 +821,7 @@ impl UsageQueueLoaderInner {
     fn new(capability: Capability) -> Self {
         Self {
             capability,
+            fifo_initial_capacity: None,
             usage_queues: DashMap::default(),
         }
     }
@@ -827,7 +829,10 @@ impl UsageQueueLoaderInner {
     fn load(&self, address: Pubkey) -> UsageQueue {
         self.usage_queues
             .entry(address)
-            .or_insert_with(|| UsageQueue::new(&self.capability))
+            .or_insert_with(|| match self.fifo_initial_capacity {
+                Some(capacity) => UsageQueue::new_fifo(capacity),
+                None => UsageQueue::new(&self.capability),
+            })
             .clone()
     }
 
@@ -1049,8 +1054,8 @@ struct ThreadManager<H: ReplaySessionHandler> {
     scheduler_id: SchedulerId,
     new_task_sender: Sender<NewTaskPayload<H::Context>>,
     new_task_receiver: Option<Receiver<NewTaskPayload<H::Context>>>,
-    session_result_sender: Sender<ResultWithTimings>,
-    session_result_receiver: Receiver<ResultWithTimings>,
+    session_result_sender: Option<Sender<SessionResult>>,
+    session_result_receiver: Receiver<SessionResult>,
     session_result_with_timings: Option<ResultWithTimings>,
     scheduler_thread: Option<JoinHandle<()>>,
     handler_threads: Vec<JoinHandle<()>>,
@@ -1058,6 +1063,11 @@ struct ThreadManager<H: ReplaySessionHandler> {
 
 struct HandlerPanicked;
 type HandlerResult = std::result::Result<Box<ExecutedTask>, HandlerPanicked>;
+
+struct SessionResult {
+    result_with_timings: ResultWithTimings,
+    handler_panicked: bool,
+}
 
 impl<H: ReplaySessionHandler> ThreadManager<H> {
     fn new(scheduler_id: SchedulerId) -> Self {
@@ -1068,7 +1078,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             scheduler_id,
             new_task_sender,
             new_task_receiver: Some(new_task_receiver),
-            session_result_sender,
+            session_result_sender: Some(session_result_sender),
             session_result_receiver,
             session_result_with_timings: None,
             scheduler_thread: None,
@@ -1285,7 +1295,9 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             // Preserve the production service lifetime even though scheduling
             // only needs handler_count, not access to execution services.
             let scheduler_services = handler_context.clone();
-            let session_result_sender = self.session_result_sender.clone();
+            // The manager must not keep a sender alive: a scheduler panic must
+            // disconnect a blocked completion waiter even without a result.
+            let session_result_sender = self.session_result_sender.take().unwrap();
             // Taking new_task_receiver here is important to ensure there's a single receiver. In
             // this way, the replay stage will get .send() failures reliably, after this scheduler
             // thread died along with the single receiver.
@@ -1334,6 +1346,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
             // by design or by means of offloading at the last resort.
             move || {
                 let _services = scheduler_services;
+                let mut handler_panicked = false;
                 let (do_now, dont_now) = (&disconnected::<()>(), &never::<()>());
                 let dummy_receiver = |trigger| {
                     if trigger { do_now } else { dont_now }
@@ -1375,6 +1388,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                             recv(finished_blocked_task_receiver) -> receiver_result => {
                                 let handler_result = receiver_result.expect("alive handler");
                                 let Ok(executed_task) = handler_result else {
+                                    handler_panicked = true;
                                     break 'nonaborted_main_loop;
                                 };
                                 state_machine.deschedule_task(&executed_task.task);
@@ -1436,6 +1450,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                             recv(finished_idle_task_receiver) -> receiver_result => {
                                 let handler_result = receiver_result.expect("alive handler");
                                 let Ok(executed_task) = handler_result else {
+                                    handler_panicked = true;
                                     break 'nonaborted_main_loop;
                                 };
                                 state_machine.deschedule_task(&executed_task.task);
@@ -1457,7 +1472,10 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                     // Finalize the current session after asserting it's explicitly requested so.
                     // Send result first because this is blocking the replay code-path.
                     session_result_sender
-                        .send(result_with_timings)
+                        .send(SessionResult {
+                            result_with_timings,
+                            handler_panicked: false,
+                        })
                         .expect("always outlived receiver");
 
                     state_machine.reinitialize();
@@ -1535,7 +1553,10 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                 // result_with_timings will contain the Err variant at this point, indicating the
                 // occurrence of transaction error.
                 session_result_sender
-                    .send(result_with_timings)
+                    .send(SessionResult {
+                        result_with_timings,
+                        handler_panicked,
+                    })
                     .expect("always outlived receiver");
 
                 // Next, drop `new_task_receiver`. After that, the paired singleton
@@ -1584,6 +1605,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                             }
                         }
                     };
+                    let task_id = task.task_id();
                     defer! {
                         if !thread::panicking() {
                             return;
@@ -1596,6 +1618,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                         error!("handler thread is panicking: {:?}", current_thread);
                         if sender.send(Err(HandlerPanicked)).is_ok() {
                             info!("notified a panic from {current_thread:?}");
+                            H::task_delivered(runnable_task_receiver.context(), task_id);
                         } else {
                             // It seems that the scheduler thread has been aborted already...
                             warn!("failed to notify a panic from {current_thread:?}");
@@ -1611,6 +1634,7 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                         warn!("handler_thread: scheduler thread aborted...");
                         break;
                     }
+                    H::task_delivered(runnable_task_receiver.context(), task_id);
                 }
             }
         };
@@ -1624,16 +1648,23 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                 .unwrap(),
         );
 
-        self.handler_threads = (0..handler_count)
-            .map({
-                |thx| {
-                    thread::Builder::new()
-                        .name(format!("solScHandle{mode_char}{thx:02}"))
-                        .spawn_tracked(handler_main_loop())
-                        .unwrap()
+        for thx in 0..handler_count {
+            match thread::Builder::new()
+                .name(format!("solScHandle{mode_char}{thx:02}"))
+                .spawn_tracked(handler_main_loop())
+            {
+                Ok(handle) => self.handler_threads.push(handle),
+                Err(error) => {
+                    // Retain and join every successfully started worker before
+                    // propagating a partial-start failure.
+                    drop(runnable_task_receiver);
+                    let _ = self.disconnect_new_task_sender();
+                    self.ensure_join_threads(true);
+                    let _ = self.take_session_result_with_timings();
+                    panic!("failed to start replay handler: {error}");
                 }
-            })
-            .collect();
+            }
+        }
     }
 
     fn send_task(&self, task: Task) -> ScheduleResult {
@@ -1646,9 +1677,9 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
     fn ensure_join_threads(&mut self, should_receive_session_result: bool) {
         trace!("ensure_join_threads() is called");
 
-        fn join_with_panic_message(join_handle: JoinHandle<()>) -> thread::Result<()> {
+        fn join_with_panic_message(join_handle: JoinHandle<()>) -> std::result::Result<(), String> {
             let thread = join_handle.thread().clone();
-            join_handle.join().inspect_err(|e| {
+            join_handle.join().map_err(|e| {
                 // Always needs to try both types for .downcast_ref(), according to
                 // https://doc.rust-lang.org/1.78.0/std/macro.panic.html:
                 //   a panic can be accessed as a &dyn Any + Send, which contains either a &str or
@@ -1659,19 +1690,32 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
                     (_, Some(s)) => s,
                     (None, None) => "<No panic info>",
                 };
-                panic!("{panic_message} (From: {thread:?})");
+                format!("{panic_message} (From: {thread:?})")
             })
         }
 
         if let Some(scheduler_thread) = self.scheduler_thread.take() {
+            let mut first_panic = None;
             for thread in self.handler_threads.drain(..) {
                 debug!("joining...: {thread:?}");
-                () = join_with_panic_message(thread).unwrap();
+                if let Err(error) = join_with_panic_message(thread) {
+                    first_panic.get_or_insert(error);
+                }
             }
-            () = join_with_panic_message(scheduler_thread).unwrap();
+            if let Err(error) = join_with_panic_message(scheduler_thread) {
+                first_panic.get_or_insert(error);
+            }
+            if let Some(error) = first_panic {
+                panic!("{error}");
+            }
 
             if should_receive_session_result {
-                let result_with_timings = self.session_result_receiver.recv().unwrap();
+                let session_result = self.session_result_receiver.recv().unwrap();
+                assert!(
+                    !session_result.handler_panicked,
+                    "handler panic without failed join"
+                );
+                let result_with_timings = session_result.result_with_timings;
                 debug!("ensure_join_threads(): err: {:?}", result_with_timings.0);
                 self.put_session_result_with_timings(result_with_timings);
             }
@@ -1747,9 +1791,15 @@ impl<H: ReplaySessionHandler> ThreadManager<H> {
 
         // Even if abort is detected, it's guaranteed that the scheduler thread puts the last
         // message into the session_result_sender before terminating.
-        let result_with_timings = self.session_result_receiver.recv().unwrap();
-        abort_detected = result_with_timings.0.is_err();
-        self.put_session_result_with_timings(result_with_timings);
+        let Ok(session_result) = self.session_result_receiver.recv() else {
+            // Scheduler failure disconnects both dispatch channels. Join
+            // handlers and scheduler before propagating the original panic.
+            self.ensure_join_threads(false);
+            panic!("replay scheduler exited without a session result");
+        };
+        abort_detected =
+            session_result.handler_panicked || session_result.result_with_timings.0.is_err();
+        self.put_session_result_with_timings(session_result.result_with_timings);
         if abort_detected {
             self.ensure_join_threads_after_abort(false);
         }
@@ -2737,6 +2787,63 @@ mod tests {
         let bank = bank_fork.read().unwrap().get(slot).unwrap();
         bank.set_fork_graph_in_program_cache(Arc::downgrade(&bank_fork));
         (bank, bank_fork)
+    }
+
+    #[test]
+    fn test_native_cost_failure_commits_without_releasing_dependent() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(50_000_000);
+        let (bank, _forks) = setup_dummy_fork_graph(Bank::new_for_tests(&genesis_config));
+        let recipient = Keypair::new();
+        let sink = solana_pubkey::new_rand();
+        use solana_account::WritableAccount;
+        use solana_signer::Signer;
+        let mut funded = bank.get_account(&mint_keypair.pubkey()).unwrap();
+        funded.set_lamports(1_000_000);
+        bank.store_account(&recipient.pubkey(), &funded);
+        bank.store_account(&sink, &funded);
+        bank.write_cost_tracker().unwrap().set_limits(
+            solana_cost_model::cost_tracker::CostTrackerLimits::new(u64::MAX, 0, u64::MAX),
+        );
+        let pool = DefaultSchedulerPool::new_dyn_for_verification(Some(2), None, None, None, None);
+        let scheduler = pool
+            .take_scheduler(SchedulingContext::new(bank.clone()))
+            .unwrap();
+        for (id, tx) in [
+            system_transaction::transfer(
+                &mint_keypair,
+                &recipient.pubkey(),
+                10,
+                genesis_config.hash(),
+            ),
+            system_transaction::transfer(&recipient, &sink, 5, genesis_config.hash()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // The first task may fail before the next submission; either path
+            // must preserve its commit and never execute its dependent.
+            if scheduler
+                .schedule_execution(
+                    RuntimeTransaction::from_transaction_for_tests(tx),
+                    id as u128,
+                )
+                .is_err()
+            {
+                break;
+            }
+        }
+        let bank = BankWithScheduler::new(bank, Some(scheduler));
+        assert_matches!(
+            bank.wait_for_completed_scheduler(),
+            Some((Err(TransactionError::WouldExceedMaxBlockCostLimit), _))
+        );
+        assert_eq!(bank.get_balance(&recipient.pubkey()), 1_000_010);
+        assert_eq!(bank.get_balance(&sink), 1_000_000);
+        assert_eq!(bank.transaction_count(), 1);
     }
 
     #[test]

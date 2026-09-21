@@ -313,7 +313,7 @@ impl WaitReason {
 
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub enum SchedulerStatus {
+pub enum SchedulerStatus<S = InstalledSchedulerBox, P = InstalledSchedulerPoolArc> {
     /// Unified scheduler is disabled or installed scheduler is consumed by
     /// [`InstalledScheduler::wait_for_termination`]. Note that transition to [`Self::Unavailable`]
     /// from {[`Self::Active`], [`Self::Stale`]} is one-way (i.e. one-time) unlike [`Self::Active`]
@@ -325,28 +325,25 @@ pub enum SchedulerStatus {
     /// transactions. This will be transitioned to [`Self::Stale`] after certain time (i.e.
     /// `solana_unified_scheduler_pool::DEFAULT_TIMEOUT_DURATION`) has passed if its bank hasn't
     /// been frozen since installed.
-    Active(InstalledSchedulerBox),
+    Active(S),
     /// Scheduler has yet to freeze its associated bank even after it's taken too long since
     /// installed, resulting in returning the scheduler back to the pool. Later, this can
     /// immediately (i.e. transparently) be transitioned to [`Self::Active`] as soon as there's new
     /// transaction to be executed (= [`BankWithScheduler::schedule_transaction_executions`] is
     /// called, which internally calls [`BankWithSchedulerInner::with_active_scheduler`] to make
     /// the transition happen).
-    Stale(InstalledSchedulerPoolArc, ResultWithTimings),
+    Stale(P, ResultWithTimings),
 }
 
-impl SchedulerStatus {
-    fn new(scheduler: Option<InstalledSchedulerBox>) -> Self {
+impl<S: Debug, P: Debug> SchedulerStatus<S, P> {
+    pub fn new(scheduler: Option<S>) -> Self {
         match scheduler {
             Some(scheduler) => SchedulerStatus::Active(scheduler),
             None => SchedulerStatus::Unavailable,
         }
     }
 
-    fn transition_from_stale_to_active(
-        &mut self,
-        f: impl FnOnce(InstalledSchedulerPoolArc, ResultWithTimings) -> InstalledSchedulerBox,
-    ) {
+    fn transition_from_stale_to_active(&mut self, f: impl FnOnce(P, ResultWithTimings) -> S) {
         let Self::Stale(pool, result_with_timings) = mem::replace(self, Self::Unavailable) else {
             panic!("transition to Active failed: {self:?}");
         };
@@ -355,7 +352,7 @@ impl SchedulerStatus {
 
     fn maybe_transition_from_active_to_stale(
         &mut self,
-        f: impl FnOnce(InstalledSchedulerBox) -> (InstalledSchedulerPoolArc, ResultWithTimings),
+        f: impl FnOnce(S) -> (P, ResultWithTimings),
     ) {
         if !matches!(self, Self::Active(_scheduler)) {
             return;
@@ -367,7 +364,7 @@ impl SchedulerStatus {
         *self = Self::Stale(pool, result_with_timings);
     }
 
-    fn transition_from_active_to_unavailable(&mut self) -> InstalledSchedulerBox {
+    fn transition_from_active_to_unavailable(&mut self) -> S {
         let Self::Active(scheduler) = mem::replace(self, Self::Unavailable) else {
             panic!("transition to Unavailable failed: {self:?}");
         };
@@ -381,11 +378,85 @@ impl SchedulerStatus {
         result_with_timings
     }
 
-    fn active_scheduler(&self) -> &InstalledSchedulerBox {
+    fn active_scheduler(&self) -> &S {
         let SchedulerStatus::Active(active_scheduler) = self else {
             panic!("not active: {self:?}");
         };
         active_scheduler
+    }
+}
+
+/// Shared attachment control flow. Context construction, pool access and
+/// observations are adapters; active/stale/error and locking rules live here.
+pub fn with_active_scheduler<S: Debug, P: Debug + Clone>(
+    status: &RwLock<SchedulerStatus<S, P>>,
+    resume: impl FnOnce(P, ResultWithTimings) -> S,
+    register_timeout: impl FnOnce(&P),
+    execute: impl FnOnce(&S) -> ScheduleResult,
+) -> ScheduleResult {
+    let scheduler = status.read().unwrap();
+    match &*scheduler {
+        SchedulerStatus::Active(scheduler) => execute(scheduler),
+        SchedulerStatus::Stale(_, (result, _)) if result.is_err() => Err(SchedulerAborted),
+        SchedulerStatus::Stale(pool, _) => {
+            let pool = pool.clone();
+            drop(scheduler);
+            let mut scheduler = status.write().unwrap();
+            scheduler.transition_from_stale_to_active(resume);
+            drop(scheduler);
+            let scheduler = status.read().unwrap();
+            register_timeout(&pool);
+            execute(scheduler.active_scheduler())
+        }
+        SchedulerStatus::Unavailable => unreachable!("no installed scheduler"),
+    }
+}
+
+/// Shared pause/final-completion state transitions. `finish` includes returning
+/// or retiring the worker session before its result can be observed by callers.
+pub fn finish_scheduler_attachment<S: Debug, P: Debug>(
+    status: &RwLock<SchedulerStatus<S, P>>,
+    paused: bool,
+    pause: impl FnOnce(&mut S),
+    finish: impl FnOnce(S) -> ResultWithTimings,
+) -> (bool, Option<ResultWithTimings>) {
+    let mut scheduler = status.write().unwrap();
+    match &mut *scheduler {
+        SchedulerStatus::Active(active) if paused => {
+            pause(active);
+            (false, None)
+        }
+        SchedulerStatus::Active(_) => {
+            let active = scheduler.transition_from_active_to_unavailable();
+            (false, Some(finish(active)))
+        }
+        SchedulerStatus::Stale(_, _) if paused => (true, None),
+        SchedulerStatus::Stale(_, _) => {
+            (true, Some(scheduler.transition_from_stale_to_unavailable()))
+        }
+        SchedulerStatus::Unavailable => (true, None),
+    }
+}
+
+/// Shared timeout reclamation. A poisoned attachment is already terminal.
+pub fn reclaim_scheduler_attachment<S: Debug, P: Debug>(
+    status: &RwLock<SchedulerStatus<S, P>>,
+    finish: impl FnOnce(S) -> (P, ResultWithTimings),
+) {
+    if let Ok(mut scheduler) = status.write() {
+        scheduler.maybe_transition_from_active_to_stale(finish);
+    }
+}
+
+pub fn recover_scheduler_error<S: Debug, P: Debug>(
+    status: &RwLock<SchedulerStatus<S, P>>,
+    recover: impl FnOnce(&mut S) -> TransactionError,
+) -> TransactionError {
+    let mut scheduler = status.write().unwrap();
+    match &mut *scheduler {
+        SchedulerStatus::Active(active) => recover(active),
+        SchedulerStatus::Stale(_, (result, _)) if result.is_err() => result.clone().unwrap_err(),
+        _ => unreachable!("no scheduler error"),
     }
 }
 
@@ -556,58 +627,25 @@ impl BankWithSchedulerInner {
         self: &Arc<Self>,
         f: impl FnOnce(&InstalledSchedulerBox) -> ScheduleResult,
     ) -> ScheduleResult {
-        let scheduler = self.scheduler.read().unwrap();
-        match &*scheduler {
-            SchedulerStatus::Active(scheduler) => {
-                // This is the fast path, needing single read-lock most of time.
-                f(scheduler)
-            }
-            SchedulerStatus::Stale(_pool, (result, _timings)) if result.is_err() => {
-                trace!(
-                    "with_active_scheduler: bank (slot: {}) has a stale aborted scheduler...",
+        with_active_scheduler(
+            &self.scheduler,
+            |pool, result_with_timings| {
+                let scheduler = pool
+                    .take_resumed_scheduler(
+                        SchedulingContext::new(self.bank.clone()),
+                        result_with_timings,
+                    )
+                    .unwrap();
+                info!(
+                    "with_active_scheduler: bank (slot: {}) got active, taking scheduler (id: {})",
                     self.bank.slot(),
+                    scheduler.id()
                 );
-                Err(SchedulerAborted)
-            }
-            SchedulerStatus::Stale(pool, _result_with_timings) => {
-                let pool = pool.clone();
-                drop(scheduler);
-
-                // Schedulers can be stale only if its mode is block-verification. So,
-                // unconditional context construction for verification is okay here.
-                let context = SchedulingContext::new(self.bank.clone());
-                let mut scheduler = self.scheduler.write().unwrap();
-                trace!("with_active_scheduler: {scheduler:?}");
-                scheduler.transition_from_stale_to_active(|pool, result_with_timings| {
-                    // Re-taking a block verification scheduler should succeed because this code
-                    // path indicates taking it succeeded previously to begin with.
-                    // Note that a block production scheduler won't reach here because the whole
-                    // callback thing is gated by BankForks::install_scheduler_into_bank().
-                    let scheduler = pool
-                        .take_resumed_scheduler(context, result_with_timings)
-                        .unwrap();
-                    info!(
-                        "with_active_scheduler: bank (slot: {}) got active, taking scheduler (id: \
-                         {})",
-                        self.bank.slot(),
-                        scheduler.id(),
-                    );
-                    scheduler
-                });
-                drop(scheduler);
-
-                let scheduler = self.scheduler.read().unwrap();
-                // Re-register a new timeout listener only after acquiring the read lock;
-                // Otherwise, the listener would again put scheduler into Stale before the read
-                // lock under an extremely-rare race condition, causing panic below in
-                // active_scheduler().
-                pool.register_timeout_listener(self.do_create_timeout_listener());
-                f(scheduler.active_scheduler())
-            }
-            SchedulerStatus::Unavailable => {
-                unreachable!("no installed scheduler for slot {}", self.bank.slot())
-            }
-        }
+                scheduler
+            },
+            |pool| pool.register_timeout_listener(self.do_create_timeout_listener()),
+            f,
+        )
     }
 
     fn do_create_timeout_listener(self: &Arc<Self>) -> TimeoutListener {
@@ -620,16 +658,11 @@ impl BankWithSchedulerInner {
                 return;
             };
 
-            let Ok(mut scheduler) = bank.scheduler.write() else {
-                // BankWithScheduler's lock is poisoned...
-                return;
-            };
-
             // Reaching here means that it's been awhile since this active scheduler is taken from
             // the pool and yet it has yet to be `wait_for_termination()`-ed. To avoid unbounded
             // thread creation under forky condition, return the scheduler for now, even if the
             // bank could process more transactions later.
-            scheduler.maybe_transition_from_active_to_stale(|scheduler| {
+            reclaim_scheduler_attachment(&bank.scheduler, |scheduler| {
                 // Return the installed scheduler back to the scheduler pool as soon as the
                 // scheduler indicates the completion of all currently-scheduled transaction
                 // executions by `solana_unified_scheduler_pool::ThreadManager::end_session()`
@@ -646,21 +679,15 @@ impl BankWithSchedulerInner {
                 );
                 (pool, result_with_timings)
             });
-            trace!("timeout_listener: {scheduler:?}");
         })
     }
 
     /// This must not be called until `Err(SchedulerAborted)` is observed. Violating this should
     /// `panic!()`.
     fn retrieve_error_after_schedule_failure(&self) -> TransactionError {
-        let mut scheduler = self.scheduler.write().unwrap();
-        match &mut *scheduler {
-            SchedulerStatus::Active(scheduler) => scheduler.recover_error_after_abort(),
-            SchedulerStatus::Stale(_pool, (result, _timings)) if result.is_err() => {
-                result.clone().unwrap_err()
-            }
-            _ => unreachable!("no error in {:?}", self.scheduler),
-        }
+        recover_scheduler_error(&self.scheduler, |scheduler| {
+            scheduler.recover_error_after_abort()
+        })
     }
 
     #[must_use]
@@ -685,30 +712,16 @@ impl BankWithSchedulerInner {
             thread::current(),
         );
 
-        let mut scheduler = scheduler.write().unwrap();
-        let (was_noop, result_with_timings) = match &mut *scheduler {
-            SchedulerStatus::Active(scheduler) if reason.is_paused() => {
-                scheduler.pause_for_recent_blockhash();
-                (false, None)
-            }
-            SchedulerStatus::Active(_scheduler) => {
-                let scheduler = scheduler.transition_from_active_to_unavailable();
-                let (result_with_timings, uninstalled_scheduler) =
-                    scheduler.wait_for_termination(reason.is_dropped());
-                uninstalled_scheduler.return_to_pool();
-                (false, Some(result_with_timings))
-            }
-            SchedulerStatus::Stale(_pool, _result_with_timings) if reason.is_paused() => {
-                // Do nothing for pauses because the scheduler termination is guaranteed to be
-                // called later.
-                (true, None)
-            }
-            SchedulerStatus::Stale(_pool, _result_with_timings) => {
-                let result_with_timings = scheduler.transition_from_stale_to_unavailable();
-                (true, Some(result_with_timings))
-            }
-            SchedulerStatus::Unavailable => (true, None),
-        };
+        let (was_noop, result_with_timings) = finish_scheduler_attachment(
+            scheduler,
+            reason.is_paused(),
+            |scheduler| scheduler.pause_for_recent_blockhash(),
+            |scheduler| {
+                let (result, uninstalled) = scheduler.wait_for_termination(reason.is_dropped());
+                uninstalled.return_to_pool();
+                result
+            },
+        );
         debug!(
             "wait_for_scheduler_termination(slot: {}, reason: {:?}): noop: {:?}, result: {:?} at \
              {:?}...",
